@@ -12,3 +12,18 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/turnstile"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "unit: kernel + products on testkit doubles; fast, zero I/O",
+    "service: in-process ASGI tests incl. SSE framing",
+    "integration: real Postgres / real provider endpoint; pre-merge or nightly",
+]
