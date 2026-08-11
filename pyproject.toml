@@ -15,10 +15,54 @@ packages = ["src/turnstile"]
 
 [dependency-groups]
 dev = [
+    "import-linter>=2.13",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "ruff>=0.16.2",
 ]
+
+# The dependency rule (docs/architecture.md §1) as a failing build.
+# TODO(M3): when `turnstile.root` / `turnstile.config` and a second product spec
+# exist, add them to these contracts plus an "independence" contract over
+# turnstile.products.specs.* (the sibling-product ban).
+# TODO(second driver): if a sibling driver lands (e.g. `turnstile.cli` next to
+# `turnstile.service`), add an "independence" contract over the drivers — they
+# consume root.assemble(), never each other.
+[tool.importlinter]
+root_package = "turnstile"
+
+[[tool.importlinter.contracts]]
+name = "Layers: products -> capabilities -> kernel"
+type = "layers"
+layers = ["turnstile.products", "turnstile.capabilities", "turnstile.kernel"]
+
+[[tool.importlinter.contracts]]
+name = "L0 kernel imports nothing internal"
+type = "forbidden"
+source_modules = ["turnstile.kernel"]
+forbidden_modules = [
+    "turnstile.capabilities",
+    "turnstile.products",
+    "turnstile.service",
+]
+
+[[tool.importlinter.contracts]]
+name = "L1 capabilities import kernel only"
+type = "forbidden"
+source_modules = ["turnstile.capabilities"]
+forbidden_modules = ["turnstile.products", "turnstile.service"]
+
+[[tool.importlinter.contracts]]
+name = "L2 products never import the service"
+type = "forbidden"
+source_modules = ["turnstile.products"]
+forbidden_modules = ["turnstile.service"]
+
+[[tool.importlinter.contracts]]
+name = "Service is driver-generic: no products/capabilities imports"
+type = "forbidden"
+source_modules = ["turnstile.service"]
+forbidden_modules = ["turnstile.products", "turnstile.capabilities"]
 
 [tool.ruff]
 target-version = "py312"
