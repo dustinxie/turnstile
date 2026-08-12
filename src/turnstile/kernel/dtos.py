@@ -8,7 +8,10 @@ import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
+
+if TYPE_CHECKING:  # avoid a runtime dtos -> ports cycle; ports.py imports dtos.py
+    from turnstile.kernel.ports import Requester
 
 # ── enums ──────────────────────────────────────────────────────────────
 
@@ -162,7 +165,14 @@ class ToolContext:
     working_dir: str
     cancel: CancellationToken = field(default_factory=CancellationToken)
     progress: ProgressSink = field(default_factory=ProgressSink)
-    requester: object | None = None
+    requester: "Requester | None" = None
+
+    async def request(self, kind: str, payload: dict) -> object:
+        """Ask the driver a structured question and await the answer. None in
+        tests/headless (no requester wired) — callers degrade fail-closed."""
+        if self.requester is None:
+            return None
+        return await self.requester.request(kind, payload)
 
 
 # ── content sidecars ───────────────────────────────────────────────────
