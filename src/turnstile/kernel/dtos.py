@@ -428,6 +428,11 @@ class ChatOptions:
     max_tokens: int | None = None
     temperature: float | None = None
     tool_choice: str = "auto"  # auto | required | none | <specific tool name>
+    # Runtime sideband, never persisted/wire-relevant: which layer owns HTTP 429
+    # retries for this call. Direct provider consumers keep "provider" (the
+    # adapter's own bounded retry); the kernel loop stamps "kernel" per round so
+    # waits stay cancellable and visible.
+    rate_limit_retry_owner: str = "provider"  # "provider" | "kernel"
 
 
 class ContinuationKind(Enum):
@@ -462,6 +467,11 @@ class RateLimitHint:
     attempt: int  # 1-based consecutive incident this turn (kernel-owned)
 
 
+RATE_LIMIT_AUTO_WAIT_SECS = 120
+"""A 429 whose window resets within this many seconds is worth waiting out
+in-place (auto-resume); beyond it the turn pauses and hands back to the user."""
+
+
 @dataclass(frozen=True)
 class RateLimitDecision:
     """Host verdict on a 429: wait_secs set -> WaitAndRetry; else Pause."""
@@ -470,6 +480,24 @@ class RateLimitDecision:
     reset_at_display: str = ""  # Pause-side display facts (may be empty)
     reset_label: str = ""
     secs_until_reset: int | None = None
+
+    @classmethod
+    def from_hint(cls, hint: RateLimitHint, jitter: float = 0.5) -> "RateLimitDecision":
+        """Conservative fallback when NO host hook supplies a verdict: wait only
+        if the kernel's own hint says the reset is imminent; with no Retry-After
+        use a bounded, jittered incident backoff (3/6/12/24/48s, jitter +/-25%);
+        a terminal (billing) 429 or a far-off reset pauses. `jitter` is clamped
+        to 0..1 — callers inject it (deterministic under a fake clock)."""
+        if hint.terminal:
+            return cls(secs_until_reset=hint.retry_after_secs)
+        if hint.retry_after_secs is None:
+            shift = min(max(hint.attempt - 1, 0), 4)
+            base = 3 << shift
+            factor = 0.75 + 0.5 * min(max(jitter, 0.0), 1.0)
+            return cls(wait_secs=max(round(base * factor), 1))
+        if hint.retry_after_secs <= RATE_LIMIT_AUTO_WAIT_SECS:
+            return cls(wait_secs=hint.retry_after_secs)
+        return cls(secs_until_reset=hint.retry_after_secs)
 
 
 @dataclass(frozen=True)

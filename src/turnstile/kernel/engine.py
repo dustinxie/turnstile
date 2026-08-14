@@ -31,6 +31,8 @@ from turnstile.kernel.dtos import (
     ProgressSink,
     PromptRejected,
     ProviderError,
+    RateLimitDecision,
+    RateLimitHint,
     Reasoning,
     ReasoningBlock,
     ReasoningSignature,
@@ -67,6 +69,82 @@ from turnstile.kernel.ports import (
     Tool,
     ToolMiddleware,
 )
+
+# ── resilience tiers (II.5) ────────────────────────────────────────────
+
+# Failed-open transient retries per round (the adapter's own fast transport
+# retries sit BELOW this tier). Visible waits: 3/6/9s.
+MAX_PROVIDER_RETRIES = 3
+# Mid-stream idle-timeout reconnects per round — only while NO content arrived
+# (replaying after content risks duplicate output/side effects).
+MAX_STREAM_RETRIES = 5
+# Consecutive WaitAndRetry rate-limit sleeps per turn before a forced pause
+# (livelock fuse for a broken hook / never-reopening window).
+MAX_RATE_LIMIT_WAITS = 5
+# Content-free 200s re-issued per TURN (an empty 200 opens fine and ends with a
+# clean Done, so the error tiers never see it).
+EMPTY_RESPONSE_MAX_RETRIES = 5
+# Auto-continuations after an output-limit truncation per turn.
+MAX_TRUNCATION_CONTINUATIONS = 2
+# The FIRST anonymous transient 429 (no host verdict, no Retry-After) retries
+# quietly after this wait — a one-off burst clears without banner spam.
+SILENT_FIRST_RATE_LIMIT_WAIT = 1.0
+
+TRUNCATION_RESUME_NUDGE = (
+    "Output limit hit — your last response was cut off before finishing. If the "
+    "task is already complete, reply with a short summary and stop (no tool "
+    "calls). Otherwise resume where you left off, writing remaining content "
+    "INCREMENTALLY (append the next section) rather than re-emitting it all in "
+    "one response."
+)
+
+# Billing/account exhaustion signatures: such a 429 must never auto-retry.
+_TERMINAL_RATE_LIMIT_CODES = frozenset(
+    {
+        "insufficient_quota",
+        "billing_hard_limit_reached",
+        "payment_required",
+        "insufficient_balance",
+        "1113",
+    }
+)
+_TERMINAL_RATE_LIMIT_NEEDLES = (
+    "insufficient quota",
+    "insufficient balance",
+    "billing hard limit",
+    "payment required",
+    "credit balance",
+    "余额不足",
+    "无可用资源包",
+    "请充值",
+)
+
+
+def _is_terminal_rate_limit(error: ProviderError) -> bool:
+    code = (error.code or "").lower()
+    if code in _TERMINAL_RATE_LIMIT_CODES:
+        return True
+    message = error.message.lower()
+    return any(needle in message for needle in _TERMINAL_RATE_LIMIT_NEEDLES)
+
+
+def _effective_retry_after(error: ProviderError) -> int | None:
+    """Authoritative Retry-After: the real header when the adapter surfaced one,
+    else a best-effort 'try again in N seconds' sniff from the body text."""
+    if error.retry_after_secs is not None:
+        return error.retry_after_secs
+    lower = error.message.lower()
+    marker = "try again in "
+    index = lower.find(marker)
+    if index < 0:
+        return None
+    digits = ""
+    for char in lower[index + len(marker) :]:
+        if not char.isdigit():
+            break
+        digits += char
+    return int(digits) if digits else None
+
 
 # ── loop fuses (II.6) ──────────────────────────────────────────────────
 
@@ -174,6 +252,11 @@ class Agent:
     resume: SessionSnapshot | None = None
     working_dir: str = "."
     request_timeout: float | None = None
+    # LIVENESS: max seconds to wait for the NEXT stream event (bounds first-token
+    # AND inter-token latency). None = unbounded. Production should set it.
+    stream_timeout: float | None = None
+    # Multiplier on every retry/backoff sleep — tests set 0 for instant retries.
+    backoff_scale: float = 1.0
 
     def spawn(self) -> AgentHandle:
         """Start the long-lived session loop; the driver owns the handle."""
@@ -409,6 +492,13 @@ class _Session:
         repeat_nudged = False
         # Typed-continuation carry: the NEXT round's response is internal-control.
         active_internal: tuple[ContinuationKind, ContinuationVisibility] | None = None
+        # Resilience counters (II.5). Per-round budgets reset on a healthy round;
+        # per-turn budgets (rate-limit waits, empty retries, truncation) don't.
+        provider_retry = 0
+        stream_retry = 0
+        rate_limit_waits = 0
+        empty_retries = 0
+        truncation_continuations = 0
 
         while True:
             round_no += 1
@@ -463,6 +553,7 @@ class _Session:
                     )
                 )
             options = replace(self._a.chat_options)
+            options.rate_limit_retry_owner = "kernel"  # loop owns 429 waits
             await self._hooks.pre_request_options(messages, options, ctx)
             await self._hooks.on_request(messages, tool_defs, options, ctx)
 
@@ -472,11 +563,101 @@ class _Session:
                 internal is not None and internal[1] is ContinuationVisibility.INTERNAL_CONTROL
             )
             started = self._a.clock.now_millis()
-            stream = await self._consume_stream(
-                messages, tool_defs, options, convo, ctx, suppress=suppress
-            )
-            if stream is None:
-                return  # terminal already emitted
+            stream = await self._consume_stream(messages, tool_defs, options, suppress=suppress)
+
+            # ── liveness timeout: reconnect while content-free, else fail ──
+            if isinstance(stream, _StreamTimeout):
+                if not stream.partial.saw_content and stream_retry < MAX_STREAM_RETRIES:
+                    stream_retry += 1
+                    self._rt.emit(
+                        ev.Warning(
+                            f"stream idle timeout — reconnecting "
+                            f"({stream_retry}/{MAX_STREAM_RETRIES})"
+                        )
+                    )
+                    await self._sleep(min(0.2 * (2 ** (stream_retry - 1)), 8.0))
+                    round_no -= 1  # a RETRY of the same logical round
+                    continue
+                if stream.partial.saw_content:
+                    # Replaying after content risks duplicate output/side effects.
+                    self._persist_partial(convo, stream.partial, suppress)
+                    message = (
+                        "stream timeout after partial response; the request "
+                        "was not replayed; partial response preserved"
+                    )
+                else:
+                    message = "stream timeout after automatic reconnects"
+                await self._hooks.on_error(message)
+                self._rt.emit(ev.Error(message=message))
+                await self._finish_turn(convo, StopReason.TIMEOUT, ctx)
+                return
+
+            # ── provider failure: 429 policy, transient retries, or terminal ──
+            if isinstance(stream, _StreamFailure):
+                error = stream.error
+                if error.http_status == 429:
+                    outcome = await self._handle_rate_limit(
+                        convo, ctx, error, stream.partial, suppress, rate_limit_waits
+                    )
+                    if outcome is None:
+                        return  # terminal emitted (pause / fuse / post-content)
+                    rate_limit_waits = outcome
+                    provider_retry = 0  # 429 never consumes the transient budget
+                    round_no -= 1
+                    continue
+                if not stream.opened and error.retryable and provider_retry < MAX_PROVIDER_RETRIES:
+                    provider_retry += 1
+                    wait = 3 * provider_retry  # 3/6/9s, visible
+                    self._rt.emit(
+                        ev.Warning(
+                            f"provider error ({error.message}); retrying in {wait}s "
+                            f"({provider_retry}/{MAX_PROVIDER_RETRIES})"
+                        )
+                    )
+                    await self._sleep(wait)
+                    round_no -= 1
+                    continue
+                if stream.partial.saw_content:
+                    self._persist_partial(convo, stream.partial, suppress)
+                await self._fail_provider(convo, ctx, error)
+                return
+
+            # A healthy round refills the per-round budgets; a natural stream end
+            # means any rate-limit incident recovered.
+            provider_retry = 0
+            stream_retry = 0
+            rate_limit_waits = 0
+
+            # ── empty-200 fast retry: a content-free Done is NOT the model
+            # choosing to stop — keyed on RAW provider content, so a redacting
+            # hook can't make a real response look empty. ──
+            if not stream.saw_content and not stream.truncated:
+                if empty_retries < EMPTY_RESPONSE_MAX_RETRIES:
+                    empty_retries += 1
+                    flavor = (
+                        "unparseable/garbled response"
+                        if stream.saw_malformed
+                        else "empty response"
+                    )
+                    self._rt.emit(
+                        ev.Warning(
+                            f"model returned an {flavor}; retrying "
+                            f"({empty_retries}/{EMPTY_RESPONSE_MAX_RETRIES})"
+                        )
+                    )
+                    await self._sleep(min((empty_retries + 1) // 2, 3))
+                    round_no -= 1
+                    continue
+                message = (
+                    f"model returned {EMPTY_RESPONSE_MAX_RETRIES} consecutive "
+                    "empty responses (upstream fault, not a clean finish); resend "
+                    "to try again"
+                )
+                await self._hooks.on_error(message)
+                self._rt.emit(ev.Error(message=message))
+                await self._finish_turn(convo, StopReason.PROVIDER_ERROR, ctx)
+                return
+
             text, reasoning, calls = stream.text, stream.reasoning, stream.calls
             usage, truncated = stream.usage, stream.truncated
 
@@ -602,6 +783,14 @@ class _Session:
             repeat_rounds = 0
             repeat_nudged = False
 
+            # ── truncation auto-continuation: output cut at the token limit
+            # with no tool call is almost always unfinished work. Runs BEFORE
+            # offer_continuation so a discipline hook can't pre-empt finishing. ──
+            if truncated and truncation_continuations < MAX_TRUNCATION_CONTINUATIONS:
+                truncation_continuations += 1
+                convo.push(Message.synthetic_user(TRUNCATION_RESUME_NUDGE))
+                continue
+
             continuation = await self._hooks.offer_typed_continuation(convo)
             if continuation is not None:
                 if (
@@ -623,23 +812,30 @@ class _Session:
                 convo.push(Message.synthetic_user(continuation.text))
                 continue
 
+            if truncated:
+                # Unrecovered truncation ending the turn — the one case the user
+                # must see: real work was cut off and is not being finished.
+                self._rt.emit(ev.Warning("response truncated: finish_reason=length"))
             await self._finish_turn(convo, StopReason.STOPPED, ctx)
             return
 
     async def _consume_stream(
-        self, messages, tool_defs, options, convo, ctx, suppress: bool = False
-    ) -> "_RoundStream | None":
-        """One provider call: open + consume. Returns the round's accumulation,
-        or None if a terminal was already emitted. suppress=True (an
-        INTERNAL_CONTROL continuation round) keeps text/reasoning off the live
-        stream AND out of the accumulation — control chatter is invisible.
-        Retry tiers land later — today any provider failure is a clean
-        PROVIDER_ERROR."""
+        self,
+        messages,
+        tool_defs,
+        options,
+        suppress: bool = False,
+    ) -> "_RoundStream | _StreamFailure | _StreamTimeout":
+        """One provider call: open + consume. Emits NO terminals — failures and
+        timeouts return typed outcomes for _run_turn's retry policy to judge.
+        suppress=True (an INTERNAL_CONTROL continuation round) keeps
+        text/reasoning off the live stream AND out of the accumulation."""
         out = _RoundStream()
         text_parts: list[str] = []
         reasoning_parts: list[str] = []
         block_parts: list[str] = []  # buffer for the CURRENT signed block
         reasoning_started: int | None = None
+        opened = False  # any event received => the open succeeded
 
         def _close_reasoning_phase() -> None:
             nonlocal reasoning_started
@@ -647,9 +843,28 @@ class _Session:
                 out.reasoning_elapsed_ms += self._a.clock.now_millis() - reasoning_started
                 reasoning_started = None
 
+        def _finalize() -> None:
+            _close_reasoning_phase()
+            out.text = "".join(text_parts)
+            out.reasoning = "".join(reasoning_parts)
+
+        iterator = aiter(self._a.provider.chat_stream(messages, tool_defs, options))
         try:
-            stream = self._a.provider.chat_stream(messages, tool_defs, options)
-            async for event in stream:
+            while True:
+                try:
+                    if self._a.stream_timeout is not None:
+                        event = await asyncio.wait_for(anext(iterator), self._a.stream_timeout)
+                    else:
+                        event = await anext(iterator)
+                except StopAsyncIteration:
+                    break
+                except TimeoutError:
+                    _finalize()
+                    return _StreamTimeout(partial=out)
+                except ProviderError as error:
+                    _finalize()
+                    return _StreamFailure(error=error, opened=opened, partial=out)
+                opened = True
                 match event:
                     case TextDelta(text=delta):
                         out.saw_content = True  # RAW arrival, before any hook —
@@ -705,20 +920,16 @@ class _Session:
                     case ResponseModel(model=model):
                         out.response_model = model
                     case ErrorEvent(error=error):
-                        await self._fail_provider(convo, ctx, error)
-                        return None
+                        _finalize()
+                        return _StreamFailure(error=error, opened=True, partial=out)
                     case Malformed():
-                        out.saw_malformed = True  # diagnostic: flavors the
-                        # empty-response retry wording (resilience commit)
+                        out.saw_malformed = True  # flavors the empty-retry wording
                     case Done(truncated=t):
                         out.truncated = t
                         break
-        except ProviderError as error:
-            await self._fail_provider(convo, ctx, error)
-            return None
-        _close_reasoning_phase()
-        out.text = "".join(text_parts)
-        out.reasoning = "".join(reasoning_parts)
+        finally:
+            pass
+        _finalize()
         return out
 
     async def _fail_provider(self, convo, ctx, error: ProviderError) -> None:
@@ -731,6 +942,100 @@ class _Session:
             )
         )
         await self._finish_turn(convo, StopReason.PROVIDER_ERROR, ctx)
+
+    async def _sleep(self, seconds: float) -> None:
+        """Every retry/backoff wait, scaled — tests set backoff_scale=0."""
+        await asyncio.sleep(seconds * self._a.backoff_scale)
+
+    def _persist_partial(
+        self, convo: Conversation, partial: "_RoundStream", suppress: bool
+    ) -> None:
+        """Persist the replay-safe portion of a failed stream: the assembled
+        assistant message (deduped complete calls), with every dangling call
+        paired to an '(interrupted before execution)' error result so a resume
+        never re-executes or sends an illegal payload."""
+        seen: set[str] = set()
+        calls = [c for c in partial.calls if not (c.id in seen or seen.add(c.id))]
+        if not partial.text and not partial.reasoning and not calls:
+            return
+        message = Message.assistant(partial.text, calls)
+        if suppress:  # control-round chatter stays invisible even when partial
+            message.text = ""
+            message.reasoning = None
+        else:
+            message.reasoning = partial.reasoning or None
+            message.reasoning_blocks = partial.reasoning_blocks
+        convo.push(message)
+        convo.backfill_interrupted_tool_results()
+
+    async def _handle_rate_limit(
+        self,
+        convo: Conversation,
+        ctx: TurnCtx,
+        error: ProviderError,
+        partial: "_RoundStream",
+        suppress: bool,
+        waits: int,
+    ) -> int | None:
+        """The 429 path. Returns the updated wait count when the round should be
+        RE-ISSUED after a (possibly silent) wait; None when a terminal was
+        emitted (post-content preserve, pause verdict, or the waits fuse)."""
+        server_message = error.message.strip() or None
+        # Once content reached the driver, a replay could duplicate output that
+        # cannot be retracted — preserve the partial and pause cleanly.
+        if partial.saw_content:
+            self._persist_partial(convo, partial, suppress)
+            self._rt.emit(
+                ev.RateLimited(
+                    auto_resuming=False,
+                    server_message=server_message,
+                )
+            )
+            await self._finish_turn(convo, StopReason.RATE_LIMITED, ctx)
+            return None
+        hint = RateLimitHint(
+            http_status=error.http_status,
+            retry_after_secs=_effective_retry_after(error),
+            terminal=_is_terminal_rate_limit(error),
+            attempt=waits + 1,
+        )
+        verdict = None if hint.terminal else await self._hooks.on_rate_limit(hint)
+        jitter = (self._a.clock.now_millis() % 1000) / 1000  # deterministic w/ fakes
+        decision = verdict if verdict is not None else RateLimitDecision.from_hint(hint, jitter)
+        if decision.wait_secs is None:  # Pause: reset too far / terminal billing
+            self._rt.emit(
+                ev.RateLimited(
+                    reset_at_display=decision.reset_at_display,
+                    reset_label=decision.reset_label,
+                    secs_until_reset=decision.secs_until_reset,
+                    auto_resuming=False,
+                    server_message=server_message,
+                )
+            )
+            await self._finish_turn(convo, StopReason.RATE_LIMITED, ctx)
+            return None
+        waits += 1
+        if waits > MAX_RATE_LIMIT_WAITS:  # livelock fuse: force a clean pause
+            self._rt.emit(
+                ev.RateLimited(
+                    auto_resuming=False,
+                    server_message=server_message,
+                )
+            )
+            await self._finish_turn(convo, StopReason.RATE_LIMITED, ctx)
+            return None
+        quiet_first = verdict is None and hint.retry_after_secs is None and waits == 1
+        if quiet_first:  # a one-off burst clears without banner spam
+            await self._sleep(SILENT_FIRST_RATE_LIMIT_WAIT)
+        else:
+            self._rt.emit(
+                ev.RateLimited(
+                    secs_until_reset=decision.wait_secs,
+                    auto_resuming=True,
+                )
+            )
+            await self._sleep(decision.wait_secs)
+        return waits
 
     # ── tool dispatch: three phases (II.3) ────────────────────────────
 
@@ -999,6 +1304,24 @@ def _tool_def(tool: Tool) -> ToolDef:
         description=tool.description(),
         parameters=tool.parameters_schema(),
     )
+
+
+@dataclass
+class _StreamFailure:
+    """A provider failure this round. opened=False (raised before any event) may
+    enter the transient retry tier; opened=True (mid-stream) is terminal for
+    non-429s. 429s route to rate-limit policy either way."""
+
+    error: ProviderError
+    opened: bool
+    partial: "_RoundStream"
+
+
+@dataclass
+class _StreamTimeout:
+    """The liveness stream_timeout elapsed waiting for the next event."""
+
+    partial: "_RoundStream"
 
 
 @dataclass

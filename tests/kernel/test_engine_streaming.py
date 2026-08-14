@@ -181,16 +181,21 @@ async def test_promotion_gated_off_for_tool_calls_signed_blocks_and_truncation()
     await _collect(Agent(provider=provider2, hooks=[keeper2]))
     assert stored2[0].text == "" and stored2[0].reasoning == "signed thinking"
 
-    # truncated round: a cut-off response is not a stop — excluded
+    # truncated round: a cut-off response is not a stop — excluded. The
+    # truncation auto-continuation (resilience commit) re-asks; script an EMPTY
+    # round 2 so the empty-200 re-issue fires once too (the two tiers compose:
+    # truncation-continue -> empty retry -> recover), then the real answer on
+    # call 3. backoff_scale=0 keeps the retry sleep out of the suite runtime.
     provider3 = ScriptedProvider(
         rounds=[
             [Reasoning("cut off"), Done(truncated=True)],
-            # (truncation auto-continuation lands in the resilience commit; today the
-            # turn just ends via offer_continuation=None)
+            [Done()],  # content-free 200: re-issued, not mistaken for a stop
+            [TextDelta("resumed and finished"), Done()],
         ]
     )
     stored3, keeper3 = _stored_via_hook()
-    await _collect(Agent(provider=provider3, hooks=[keeper3]))
+    await _collect(Agent(provider=provider3, hooks=[keeper3], backoff_scale=0.0))
+    assert len(provider3.calls) == 3  # truncated -> empty retry -> answered
     assert stored3[0].text == "" and stored3[0].reasoning == "cut off"
     meta3 = stored3[0].meta
     assert meta3 is not None
