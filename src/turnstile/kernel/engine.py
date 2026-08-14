@@ -18,6 +18,8 @@ from turnstile.kernel import events as ev
 from turnstile.kernel.dtos import (
     SNAPSHOT_VERSION,
     ChatOptions,
+    ContinuationKind,
+    ContinuationVisibility,
     Conversation,
     Done,
     ErrorEvent,
@@ -45,7 +47,12 @@ from turnstile.kernel.dtos import (
     TurnCtx,
     UsageEvent,
 )
-from turnstile.kernel.events import AgentCommand, Outcome, RequestCtx
+from turnstile.kernel.events import (
+    ROUND_CAP_CHECKPOINT_KIND,
+    AgentCommand,
+    Outcome,
+    RequestCtx,
+)
 from turnstile.kernel.ports import (
     Clock,
     CompactionCheckpoint,
@@ -58,6 +65,68 @@ from turnstile.kernel.ports import (
     Tool,
     ToolMiddleware,
 )
+
+# ── loop fuses (II.6) ──────────────────────────────────────────────────
+
+# Always-on coarse repetition fuse: same model-emitted call pattern for too many
+# CONSECUTIVE rounds, even when results change ("same choice regardless of
+# results"). A course-correction nudge fires first.
+MAX_REPEAT_ROUNDS = 6
+REPEAT_NUDGE_AT = 3
+REPEAT_LOOP_NUDGE = (
+    "You have issued the SAME tool call with the SAME arguments several rounds "
+    "in a row. Stop repeating it and change your approach. If the task is done, "
+    "reply with a short summary and no tool calls. If you are blocked, explain "
+    "what you need."
+)
+TOOL_LOOP_NUDGE = (
+    "[Tool-loop guard] The same tool call or read-only batch has returned the "
+    "same result(s) repeatedly. Do not repeat it unchanged. Reassess the task, "
+    "use a different action, or explain why no further progress is possible."
+)
+
+
+@dataclass(frozen=True)
+class ToolLoopPolicy:
+    """Opt-in EXACT no-progress guard ("same call + same result"): warn at
+    warning_threshold identical observations, stop at stop_threshold. The warning
+    must leave the model a real chance to change course before the stop."""
+
+    warning_threshold: int = 3
+    stop_threshold: int = 4
+
+    def __post_init__(self) -> None:
+        if self.warning_threshold < 2:
+            raise ValueError("tool-loop warning threshold must be at least 2")
+        if self.warning_threshold >= self.stop_threshold:
+            raise ValueError("tool-loop warning threshold must be below stop threshold")
+
+
+class _ToolLoopState:
+    """Session-owned exact-loop streak. Persists across synthetic turns (an
+    automated goal can't evade the guard by opening fresh turns); a REAL user
+    prompt resets it (new intent scope)."""
+
+    def __init__(self, policy: ToolLoopPolicy) -> None:
+        self.policy = policy
+        self.last: tuple | None = None
+        self.consecutive = 0
+
+    def reset(self) -> None:
+        self.last = None
+        self.consecutive = 0
+
+    def observe(self, fingerprint: tuple) -> str:
+        if fingerprint == self.last:
+            self.consecutive += 1
+        else:
+            self.last = fingerprint
+            self.consecutive = 1
+        if self.consecutive >= self.policy.stop_threshold:
+            return "stop"
+        if self.consecutive == self.policy.warning_threshold:
+            return "warn"
+        return "continue"
 
 
 @dataclass
@@ -82,6 +151,13 @@ class Agent:
     # SAFETY FUSE, defaults ON: an offer_continuation hook that always continues
     # is an infinite kernel-driven loop with no model agency to stop it.
     max_continuations: int | None = 50
+    # When True, the max_rounds fuse becomes an interactive CHECKPOINT: the
+    # kernel round-trips the driver ("continue past the cap?") and re-arms the
+    # cap by the base amount on yes; a no/unanswered request stops fail-closed.
+    round_cap_checkpoint: bool = False
+    # Opt-in exact no-progress guard (product policy; the coarse REPEAT_LOOP
+    # fuse is always on regardless).
+    tool_loop_policy: ToolLoopPolicy | None = None
     # Phase-② concurrency cap for parallel-safe tools (side-effecting tools
     # always serialize regardless).
     max_parallel_tools: int = 4
@@ -145,6 +221,9 @@ class _Session:
         self._turn_counter = 0
         self._request_counter = 0
         self._pending_getter: asyncio.Task | None = None
+        self._tool_loop_state = (
+            _ToolLoopState(agent.tool_loop_policy) if agent.tool_loop_policy is not None else None
+        )
 
     # ── session lifecycle ─────────────────────────────────────────────
 
@@ -268,6 +347,10 @@ class _Session:
             self._rt.emit(ev.Error(message=f"prompt rejected: {reason}"))
             self._rt.emit(ev.TurnComplete(StopReason.PROMPT_REJECTED))
             return False
+        if not synthetic and self._tool_loop_state is not None:
+            # A REAL user submission starts a new intent scope; synthetic
+            # continuations keep the accumulated exact-loop evidence.
+            self._tool_loop_state.reset()
         if context is not None:  # host-owned context rides the SAME turn
             convo.push(Message.synthetic_user(context))
         if synthetic:
@@ -316,6 +399,14 @@ class _Session:
         turn_id = self._turn_counter
         round_no = 0
         continuations = 0
+        # Re-armable round cap (grows on a checkpoint "continue").
+        round_cap = self._a.max_rounds
+        # Coarse repetition fuse state (per turn).
+        repeat_sig: str | None = None
+        repeat_rounds = 0
+        repeat_nudged = False
+        # Typed-continuation carry: the NEXT round's response is internal-control.
+        active_internal: tuple[ContinuationKind, ContinuationVisibility] | None = None
 
         while True:
             round_no += 1
@@ -331,10 +422,28 @@ class _Session:
                 context_window=ctx_window,
                 used_tokens=used_tokens,
             )
-            if self._a.max_rounds is not None and round_no > self._a.max_rounds:
-                self._rt.emit(ev.Error(message=f"max rounds ({self._a.max_rounds}) reached"))
-                await self._finish_turn(convo, StopReason.MAX_ROUNDS, ctx)
-                return
+            if round_cap is not None and round_no > round_cap:
+                if self._a.round_cap_checkpoint:
+                    answer = await self._rt.request(
+                        ROUND_CAP_CHECKPOINT_KIND,
+                        {
+                            "round": round_no - 1,
+                            "cap": round_cap,
+                            "base": self._a.max_rounds,
+                        },
+                    )
+                    if isinstance(answer, dict) and answer.get("continue"):
+                        # Re-arm by the base amount (round_cap started as
+                        # max_rounds, so it is the fallback base when unset).
+                        base = self._a.max_rounds if self._a.max_rounds is not None else round_cap
+                        round_cap += base
+                    else:  # explicit stop OR fail-closed (no answer / timeout)
+                        await self._finish_turn(convo, StopReason.MAX_ROUNDS, ctx)
+                        return
+                else:
+                    self._rt.emit(ev.Error(message=f"max rounds ({round_cap}) reached"))
+                    await self._finish_turn(convo, StopReason.MAX_ROUNDS, ctx)
+                    return
 
             # Project the request: EPHEMERAL clone; hooks may append reminders.
             messages = list(convo.messages)
@@ -355,8 +464,15 @@ class _Session:
             await self._hooks.pre_request_options(messages, options, ctx)
             await self._hooks.on_request(messages, tool_defs, options, ctx)
 
+            internal = active_internal
+            active_internal = None
+            suppress = (
+                internal is not None and internal[1] is ContinuationVisibility.INTERNAL_CONTROL
+            )
             started = self._a.clock.now_millis()
-            outcome = await self._consume_stream(messages, tool_defs, options, convo, ctx)
+            outcome = await self._consume_stream(
+                messages, tool_defs, options, convo, ctx, suppress=suppress
+            )
             if outcome is None:
                 return  # terminal already emitted
             text, reasoning, calls, usage, truncated, response_id, response_model = outcome
@@ -366,6 +482,11 @@ class _Session:
             used = usage.prompt if usage.prompt > 0 else sum(m.estimate_tokens() for m in messages)
             assistant = Message.assistant(text, calls)
             assistant.reasoning = reasoning or None
+            if internal is not None and internal[0] is ContinuationKind.VERIFY_CADENCE:
+                # Control chatter stays out of user-visible history.
+                assistant.internal_origin = "verify_cadence"
+                assistant.text = ""
+                assistant.reasoning = None
             assistant.meta = MessageMeta(
                 tokens=usage,
                 elapsed_ms=self._a.clock.now_millis() - started,
@@ -386,11 +507,75 @@ class _Session:
             convo.push(assistant)
 
             if calls:
-                stop = await self._dispatch_tools(convo, calls, tools, turn_id, round_no)
+                stop, fingerprint = await self._dispatch_tools(
+                    convo, calls, tools, turn_id, round_no
+                )
                 if stop is not None:
                     await self._finish_turn(convo, stop, ctx)
                     return
+
+                # ── exact no-progress guard (opt-in; owns the streak) ──
+                exact_active = False
+                if self._tool_loop_state is not None:
+                    state = self._tool_loop_state
+                    verdict = "continue"
+                    if fingerprint is not None:
+                        verdict = state.observe(fingerprint)
+                    else:
+                        state.reset()  # ineligible batch breaks the evidence chain
+                    exact_active = state.consecutive > 1
+                    if verdict == "warn":
+                        self._rt.emit(
+                            ev.Warning(
+                                "possible tool loop: identical call and result "
+                                f"{state.policy.warning_threshold} times; asking the "
+                                "model to change course"
+                            )
+                        )
+                        convo.push(Message.synthetic_user(TOOL_LOOP_NUDGE))
+                    elif verdict == "stop":
+                        self._rt.emit(
+                            ev.Warning(
+                                "tool loop detected: identical call and result "
+                                f"{state.policy.stop_threshold} times; stopping"
+                            )
+                        )
+                        await self._finish_turn(convo, StopReason.TOOL_LOOP_DETECTED, ctx)
+                        return
+
+                # ── always-on coarse repetition fuse ──
+                signature = "\x01".join(
+                    sorted(f"{c.name}\x00{_canonicalize_args(c.arguments)}" for c in calls)
+                )
+                if signature == repeat_sig:
+                    repeat_rounds += 1
+                else:
+                    repeat_sig = signature
+                    repeat_rounds = 1
+                    repeat_nudged = False
+                if not exact_active:  # an active exact streak owns these rounds
+                    if repeat_rounds >= MAX_REPEAT_ROUNDS:
+                        self._rt.emit(
+                            ev.Error(
+                                message=(
+                                    "stopped: the model repeated the same tool-call "
+                                    f"pattern for {repeat_rounds} consecutive rounds"
+                                )
+                            )
+                        )
+                        await self._finish_turn(convo, StopReason.REPEAT_LOOP, ctx)
+                        return
+                    if repeat_rounds >= REPEAT_NUDGE_AT and not repeat_nudged:
+                        repeat_nudged = True
+                        convo.push(Message.synthetic_user(REPEAT_LOOP_NUDGE))
                 continue
+
+            # A no-tool round is an observable break in repetition evidence.
+            if self._tool_loop_state is not None:
+                self._tool_loop_state.reset()
+            repeat_sig = None
+            repeat_rounds = 0
+            repeat_nudged = False
 
             continuation = await self._hooks.offer_typed_continuation(convo)
             if continuation is not None:
@@ -409,16 +594,22 @@ class _Session:
                     await self._finish_turn(convo, StopReason.MAX_CONTINUATIONS, ctx)
                     return
                 continuations += 1
+                active_internal = (continuation.kind, continuation.visibility)
                 convo.push(Message.synthetic_user(continuation.text))
                 continue
 
             await self._finish_turn(convo, StopReason.STOPPED, ctx)
             return
 
-    async def _consume_stream(self, messages, tool_defs, options, convo, ctx):
+    async def _consume_stream(
+        self, messages, tool_defs, options, convo, ctx, suppress: bool = False
+    ):
         """One provider call: open + consume. Returns the round's accumulation,
-        or None if a terminal was already emitted. Retry tiers land later —
-        today any provider failure is a clean PROVIDER_ERROR."""
+        or None if a terminal was already emitted. suppress=True (an
+        INTERNAL_CONTROL continuation round) keeps text/reasoning off the live
+        stream AND out of the accumulation — control chatter is invisible.
+        Retry tiers land later — today any provider failure is a clean
+        PROVIDER_ERROR."""
         text_parts: list[str] = []
         reasoning_parts: list[str] = []
         calls: list = []
@@ -432,12 +623,12 @@ class _Session:
                 match event:
                     case TextDelta(text=delta):
                         delta = await self._hooks.on_text_delta(delta)
-                        if delta:
+                        if delta and not suppress:
                             text_parts.append(delta)
                             self._rt.emit(ev.TextDelta(delta))
                     case Reasoning(text=delta):
                         delta = await self._hooks.on_reasoning_delta(delta)
-                        if delta:
+                        if delta and not suppress:
                             reasoning_parts.append(delta)
                             self._rt.emit(ev.Reasoning(delta))
                     case ToolCallEvent(call=call):
@@ -498,9 +689,13 @@ class _Session:
         tools: dict[str, Tool],
         turn_id: int,
         round_no: int,
-    ) -> StopReason | None:
+    ) -> tuple[StopReason | None, tuple | None]:
         """① classify → ② execute (concurrent) → ③ apply (in order).
-        Returns POLICY_DENIED when a DENY_TURN middleware fired, else None."""
+        Returns (stop, fingerprint): stop=POLICY_DENIED when a DENY_TURN fired;
+        fingerprint is the exact-loop evidence (sorted per-call tool + canonical
+        args + post-cap result + success state) when the batch is ELIGIBLE — one
+        real execution or an all-parallel-safe batch, no stubs/blocks/images —
+        else None (ineligible batches break the streak)."""
         # ── Phase ① CLASSIFY (in emission order) ──
         plans: list[_Skip | _Ready | _Execute] = []
         result_ids: set[str] = set()  # call_ids already resulted this batch (mode A)
@@ -657,6 +852,14 @@ class _Session:
         policy_denied = False
         batch_ok = 0
         lifted_images: list = []
+        # Exact-loop eligibility: one real execution, or an all-parallel-safe
+        # batch (emission order isn't semantic progress there). Stubs, blocks,
+        # unknown tools, images, and post-blocks are ineligible.
+        executes = [p for p in plans if isinstance(p, _Execute)]
+        loop_eligible = 0 < len(plans) == len(executes) and (
+            len(executes) == 1 or all(p.parallel_safe for p in executes)
+        )
+        loop_entries: list[tuple] = []
         for plan, result in zip(plans, results, strict=True):
             if isinstance(plan, _Skip) or result is None:
                 continue
@@ -666,6 +869,18 @@ class _Session:
                 if after.block_reason is not None and post_block is None:
                     post_block = after.block_reason
             _cap_tool_result(result, self._a.max_tool_result_bytes)
+            if loop_eligible and isinstance(plan, _Execute):
+                if result.images or post_block is not None:
+                    loop_eligible = False
+                else:
+                    loop_entries.append(
+                        (
+                            plan.call.name,
+                            _canonicalize_args(plan.call.arguments),
+                            result.content,
+                            result.is_error,
+                        )
+                    )
             if result.is_error:
                 await self._hooks.on_error(result.content)
             elif batch_id is not None:
@@ -698,7 +913,8 @@ class _Session:
                     images=lifted_images,
                 )
             )
-        return StopReason.POLICY_DENIED if policy_denied else None
+        fingerprint = tuple(sorted(loop_entries)) if loop_eligible and loop_entries else None
+        return (StopReason.POLICY_DENIED if policy_denied else None, fingerprint)
 
     async def _execute_one(self, plan: "_Execute", semaphore: asyncio.Semaphore) -> ToolResult:
         async with semaphore:
