@@ -6,7 +6,7 @@ docs/kernel-loop-structure.md Part I.
 
 import asyncio
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TYPE_CHECKING, ClassVar
 
@@ -643,6 +643,110 @@ class Conversation:
         for call_id in missing:
             self.push(Message.tool_result(call_id, content, is_error=True))
 
+    def prepare_plan(self, plan: CompactionPlan, sacred_floor: int) -> "PreparedCompaction":
+        """Revalidate and stage a strategy's proposal WITHOUT touching live state.
+        The kernel — never the strategy — owns every invariant here:
+
+        1. CLAMP: drain_from >= sacred_floor (the protected prefix is never
+           drained), drain_to <= len; an inverted/empty range drains nothing.
+        2. COMPUTE-THEN-COMMIT net-loss guard: build the candidate (drain range
+           -> optional ONE synthetic summary at drain_from -> translated rewrites
+           -> trailing resume note -> repair_pairing for API validity), measure
+           wire bytes before vs after, and stage a commit ONLY if strictly
+           smaller. A refused/no-op plan burns no cache epoch.
+        3. On a viable candidate: bump cache_epoch exactly once and scale the
+           surviving last assistant's used_tokens/utilization by the byte ratio
+           (pressure relief — else the auto trigger re-fires off stale meta).
+        """
+        epoch_before = self.cache_epoch
+        bytes_before = sum(_wire_size(m) for m in self.messages)
+        length = len(self.messages)
+
+        floor = min(sacred_floor, length)
+        drain_from = min(max(plan.drain_from, floor), length)
+        drain_to = min(plan.drain_to, length)
+        if drain_from >= drain_to:  # inverted/empty -> drain nothing
+            drain_from = drain_to = min(drain_from, length)
+
+        candidate = list(self.messages[:drain_from])
+        if plan.summary is not None:
+            candidate.append(Message.synthetic_user(plan.summary))
+        candidate.extend(self.messages[drain_to:])
+        # Rewrites use ORIGINAL indices (the same space as drain_from/drain_to):
+        # skip the sacred prefix and the drained range; translate survivors past
+        # the removed range and the optional summary insert. Out-of-range -> skip.
+        summary_shift = 1 if plan.summary is not None else 0
+        for original_index, new_text in plan.rewrites:
+            if original_index < floor:
+                continue  # sacred prefix stays frozen for rewrites too
+            if drain_from <= original_index < drain_to:
+                continue  # drained away — nothing to rewrite
+            if original_index < drain_from:
+                candidate_index = original_index
+            else:
+                candidate_index = drain_from + summary_shift + (original_index - drain_to)
+            if 0 <= candidate_index < len(candidate):
+                rewritten = replace(candidate[candidate_index])
+                rewritten.text = new_text
+                candidate[candidate_index] = rewritten
+        if plan.resume_note is not None:
+            candidate.append(Message.synthetic_user(plan.resume_note))
+        # API validity is kernel-owned: a drain that splits a call/result pair
+        # gets repaired here; if the repair growth defeats the shrink, the plan
+        # is correctly refused below (the original was valid).
+        Conversation.repair_pairing(candidate)
+
+        bytes_after = sum(_wire_size(m) for m in candidate)
+        committed = bytes_after < bytes_before
+        if not committed:
+            return PreparedCompaction(
+                candidate=None,
+                report=CompactReport(
+                    epoch_before=epoch_before,
+                    epoch_after=epoch_before,
+                    removed=0,
+                    bytes_before=bytes_before,
+                    bytes_after=bytes_after,
+                    committed=False,
+                ),
+            )
+        # PRESSURE RELIEF: the auto trigger reads the last assistant's frozen
+        # meta.used_tokens; without scaling it by the shrink ratio the SAME high
+        # figure re-fires compaction at the next boundary despite the shrink.
+        if bytes_before > 0:
+            ratio = bytes_after / bytes_before
+            for message in reversed(candidate):
+                if message.role is Role.ASSISTANT and message.meta is not None:
+                    relieved = replace(message.meta)
+                    relieved.used_tokens = round(relieved.used_tokens * ratio)
+                    relieved.utilization = relieved.utilization * ratio
+                    patched = replace(message)
+                    patched.meta = relieved
+                    candidate[candidate.index(message)] = patched
+                    break
+        return PreparedCompaction(
+            candidate=Conversation(messages=candidate, cache_epoch=epoch_before + 1),
+            report=CompactReport(
+                epoch_before=epoch_before,
+                epoch_after=epoch_before + 1,
+                removed=length - len(candidate),
+                bytes_before=bytes_before,
+                bytes_after=bytes_after,
+                committed=True,
+            ),
+        )
+
+    def commit_prepared(self, prepared: "PreparedCompaction") -> CompactReport:
+        """Make a prepared candidate live — no fallible work after a checkpoint."""
+        if prepared.candidate is not None:
+            self.messages[:] = prepared.candidate.messages
+            self.cache_epoch = prepared.candidate.cache_epoch
+        return prepared.report
+
+    def apply_plan(self, plan: CompactionPlan, sacred_floor: int) -> CompactReport:
+        """Prepare + commit in one step (callers without a checkpoint gate)."""
+        return self.commit_prepared(self.prepare_plan(plan, sacred_floor))
+
     @staticmethod
     def repair_pairing(messages: list[Message]) -> None:
         """Make a message list API-VALID in place: every assistant tool_call gets
@@ -676,6 +780,26 @@ class Conversation:
                     resolved.add(call_id)
                     rebuilt.append(Message.tool_result(call_id, "(cancelled)", is_error=True))
         messages[:] = rebuilt
+
+
+def _wire_size(message: Message) -> int:
+    """Deterministic size proxy: the bytes that ride the wire for a message —
+    NOT just text. Dropping a text-light but TOOL-CALL-heavy message (big JSON
+    arguments) must register as a reduction, or the strictly-smaller net-loss
+    guard would refuse genuinely shrinking compactions of tool-heavy histories."""
+    calls = sum(len(c.id) + len(c.name) + len(c.arguments) for c in message.tool_calls)
+    return (
+        len(message.text) + len(message.reasoning or "") + calls + len(message.tool_call_id or "")
+    )
+
+
+@dataclass
+class PreparedCompaction:
+    """A compaction candidate that passed every kernel invariant but is not live
+    yet — lets a durable checkpoint be written BEFORE the infallible commit."""
+
+    candidate: Conversation | None  # None = the plan was REFUSED
+    report: CompactReport
 
 
 SNAPSHOT_VERSION = 1

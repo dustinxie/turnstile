@@ -17,8 +17,10 @@ from dataclasses import dataclass, field, replace
 from turnstile.kernel import events as ev
 from turnstile.kernel.dtos import (
     SNAPSHOT_VERSION,
+    AutoTrigger,
     CancellationToken,
     ChatOptions,
+    CompactionView,
     ContinuationKind,
     ContinuationVisibility,
     Conversation,
@@ -29,6 +31,7 @@ from turnstile.kernel.dtos import (
     ManualTrigger,
     Message,
     MessageMeta,
+    OverflowTrigger,
     ProgressSink,
     PromptRejected,
     ProviderError,
@@ -39,6 +42,7 @@ from turnstile.kernel.dtos import (
     ReasoningSignature,
     ResponseId,
     ResponseModel,
+    Role,
     SessionSnapshot,
     StopReason,
     TextDelta,
@@ -61,6 +65,7 @@ from turnstile.kernel.events import (
 from turnstile.kernel.ports import (
     Clock,
     CompactionCheckpoint,
+    CompactionCheckpointError,
     CompactionStrategy,
     HookChain,
     LifecycleHooks,
@@ -98,6 +103,20 @@ MAX_TRUNCATION_CONTINUATIONS = 2
 # The FIRST anonymous transient 429 (no host verdict, no Retry-After) retries
 # quietly after this wait — a one-off burst clears without banner spam.
 SILENT_FIRST_RATE_LIMIT_WAIT = 1.0
+# Bounded overflow-recovery compact-and-retry attempts per round; a genuinely
+# unrecoverable history (sacred floor alone over the window) still terminates.
+MAX_OVERFLOW_ATTEMPTS = 3
+
+
+def _effective_input_limit(window: int, max_tokens: int | None) -> int:
+    """The mid-turn input budget: window minus a completion reservation and a
+    margin covering the byte-estimate's undercount. Unrealistically small
+    windows (test fixtures) skip the reserve rather than go negative."""
+    reserve = (max_tokens if max_tokens is not None else 16_384) + max(
+        min(window // 8, 128_000), 16_000
+    )
+    return window if reserve >= window else window - reserve
+
 
 TRUNCATION_RESUME_NUDGE = (
     "Output limit hit — your last response was cut off before finishing. If the "
@@ -265,6 +284,9 @@ class Agent:
     # safety bound (context bloat). 0 = unbounded.
     max_tool_result_bytes: int = 64 * 1024
     compaction: CompactionStrategy = field(default_factory=NoCompaction)
+    # Utilization fraction (0..1) at/above which the AUTO task-boundary trigger
+    # fires. None (default) = NEVER auto-compact — the neutral kernel default.
+    compact_threshold: float | None = None
     checkpoint: CompactionCheckpoint | None = None
     chat_options: ChatOptions = field(default_factory=ChatOptions)
     clock: Clock = field(default_factory=SystemClock)
@@ -376,6 +398,98 @@ class _Session:
         snap.request_counter = max(snap.request_counter, self._request_counter)
         return snap
 
+    # ── compaction (II.7: strategy proposes, kernel disposes) ──────────
+
+    def _build_view(self, convo: Conversation, trigger) -> CompactionView:
+        """Pressure facts sized to the CURRENT model window (a compaction after a
+        model switch must use the NEW window), falling back to the recorded one."""
+        recorded_window, used_tokens, _ = convo.last_pressure()
+        live_window = self._a.provider.context_window()
+        window = live_window if live_window > 0 else recorded_window
+        utilization = (used_tokens / window) if window > 0 else 0.0
+        return CompactionView(
+            messages=convo.messages,
+            trigger=trigger,
+            ctx_window=window,
+            used_tokens=used_tokens,
+            utilization=utilization,
+            sacred_floor=convo.sacred_floor(),
+        )
+
+    def _should_compact(self, convo: Conversation) -> AutoTrigger | None:
+        """AUTO task-boundary trigger: the last stored turn's RAW prompt tokens,
+        recomputed against the LIVE window, crossed the threshold. Reads
+        used_tokens — never the stored utilization ratio, which baked in whatever
+        window was active when recorded (a switch to a smaller model must
+        re-evaluate). None = no threshold configured (default: never)."""
+        threshold = self._a.compact_threshold
+        if threshold is None:
+            return None
+        recorded_window, used_tokens, _ = convo.last_pressure()
+        if used_tokens == 0:
+            return None
+        live_window = self._a.provider.context_window()
+        window = live_window if live_window > 0 else recorded_window
+        if window <= 0:
+            return None  # can't gauge pressure -> don't act
+        utilization = used_tokens / window
+        if utilization < threshold:
+            return None
+        return AutoTrigger(utilization=utilization)
+
+    async def _run_compaction(self, convo: Conversation, trigger) -> None:
+        """One compaction: view -> strategy plan -> kernel prepare (clamps,
+        net-loss guard, epoch) -> checkpoint gate (committed MANUAL only) ->
+        commit -> Compacted event. A failed checkpoint save leaves the live
+        conversation and epoch untouched (CompactionFailed)."""
+        view = self._build_view(convo, trigger)
+        if self._a.compaction.will_summarize(view):
+            # Announce BEFORE possibly multi-second summary work — but never a
+            # spurious "compacting…" line ahead of a no-op.
+            self._rt.emit(ev.CompactionStarted(trigger=trigger))
+        plan = await self._a.compaction.plan(view)
+        prepared = convo.prepare_plan(plan, view.sacred_floor)
+        snapshot: SessionSnapshot | None = None
+        if prepared.report.committed and isinstance(trigger, ManualTrigger):
+            # Durable-write gate: a committed manual compaction becomes live only
+            # after the checkpoint holds the exact post-compaction working set.
+            assert prepared.candidate is not None
+            snapshot = self._capture_snapshot(prepared.candidate)
+            if self._a.checkpoint is not None:
+                try:
+                    self._a.checkpoint.save(snapshot)
+                except CompactionCheckpointError as error:
+                    self._rt.emit(ev.CompactionFailed(trigger=trigger, error=str(error)))
+                    return
+        report = convo.commit_prepared(prepared)
+        self._rt.emit(
+            ev.Compacted(
+                trigger=trigger,
+                epoch=report.epoch_after,
+                removed=report.removed,
+                bytes_before=report.bytes_before,
+                bytes_after=report.bytes_after,
+                committed=report.committed,
+                snapshot=snapshot,
+            )
+        )
+
+    async def _maybe_compact_internal(
+        self, convo: Conversation, attempted_stages: list[bool]
+    ) -> None:
+        """Internal continuations bypass the task-boundary check; give them the
+        same opportunity, at most once per POLICY STAGE (cheap rewrite vs slow
+        summary) per turn — a moderate-pressure stub must not suppress a later
+        high-pressure summary."""
+        trigger = self._should_compact(convo)
+        if trigger is None:
+            return
+        stage = 1 if self._a.compaction.will_summarize(self._build_view(convo, trigger)) else 0
+        if attempted_stages[stage]:
+            return
+        attempted_stages[stage] = True
+        await self._run_compaction(convo, trigger)
+
     async def run(self, commands: asyncio.Queue) -> None:
         convo, resumed = self._seed()
         await self._hooks.session_start(convo, resumed)
@@ -393,18 +507,9 @@ class _Session:
                 case ev.RequestSnapshot():
                     self._rt.emit(ev.Snapshot(self._capture_snapshot(convo)))
                 case ev.Compact(focus=focus):
-                    # TODO(M1 compaction commit): full plan/apply. NoCompaction
-                    # (the default) always produces a refused no-op.
-                    self._rt.emit(
-                        ev.Compacted(
-                            trigger=ManualTrigger(focus=focus),
-                            epoch=convo.cache_epoch,
-                            removed=0,
-                            bytes_before=0,
-                            bytes_after=0,
-                            committed=False,
-                        )
-                    )
+                    # MANUAL compaction: runs the injected strategy regardless of
+                    # any auto threshold; a net-loss/no-op plan is still refused.
+                    await self._run_compaction(convo, ManualTrigger(focus=focus))
                 case ev.SendMessage(text=text, images=images):
                     shutdown = await self._process_prompt(
                         convo, commands, pending, text, images, synthetic=False
@@ -467,6 +572,14 @@ class _Session:
             # A REAL user submission starts a new intent scope; synthetic
             # continuations keep the accumulated exact-loop evidence.
             self._tool_loop_state.reset()
+        # ── TASK-BOUNDARY auto-compaction: the cache-safe trigger point — a
+        # committed compaction opens a new epoch, then this turn appends onto the
+        # compacted history. Never fired inside the round loop (that would reopen
+        # the within-turn cache break); the sole mid-turn exception is hard
+        # overflow recovery, where the cache is already lost.
+        auto_trigger = self._should_compact(convo)
+        if auto_trigger is not None:
+            await self._run_compaction(convo, auto_trigger)
         # CANCEL = UNDO rollback point: history length BEFORE this turn pushed
         # anything (context and prompt roll back together).
         rollback_len = len(convo.messages)
@@ -588,6 +701,9 @@ class _Session:
         rate_limit_waits = 0
         empty_retries = 0
         truncation_continuations = 0
+        overflow_attempts = 0
+        # One internal-compaction attempt per policy stage (stub vs summary).
+        compaction_stages_attempted = [False, False]
 
         while True:
             round_no += 1
@@ -658,6 +774,29 @@ class _Session:
                         "from stored history — this poisons the provider prefix cache"
                     )
                 )
+            # ── PRE-SEND emergency compaction: a mid-turn burst of large tool
+            # outputs can outgrow the window WITHIN one turn — the case the
+            # between-turn trigger misses, and a gateway that answers over-window
+            # with an empty 200 never returns the overflow error below. Bounded;
+            # stops early when a pass drains nothing (single oversized input at
+            # the sacred floor — fall through and let the tiers handle it). ──
+            window = self._a.provider.context_window()
+            if window > 0 and any(m.role is Role.ASSISTANT for m in convo.messages):
+                limit = _effective_input_limit(window, self._a.chat_options.max_tokens)
+                presend_attempts = 0
+                while (
+                    sum(m.estimate_tokens() for m in messages) >= limit
+                    and presend_attempts < MAX_OVERFLOW_ATTEMPTS
+                ):
+                    before = sum(m.estimate_tokens() for m in convo.messages)
+                    await self._run_compaction(convo, OverflowTrigger(attempt=presend_attempts))
+                    presend_attempts += 1
+                    if sum(m.estimate_tokens() for m in convo.messages) >= before:
+                        break  # nothing drained — unrecoverable by compaction
+                    messages = list(convo.messages)  # re-project on the new epoch
+                    await self._hooks.pre_request(messages, ctx)
+                    Conversation.repair_pairing(messages)
+
             options = replace(self._a.chat_options)
             options.rate_limit_retry_owner = "kernel"  # loop owns 429 waits
             await self._hooks.pre_request_options(messages, options, ctx)
@@ -700,9 +839,26 @@ class _Session:
                 await self._finish_turn(convo, StopReason.TIMEOUT, ctx)
                 return
 
-            # ── provider failure: 429 policy, transient retries, or terminal ──
+            # ── provider failure: overflow recovery, 429 policy, transient
+            # retries, or terminal ──
             if isinstance(stream, _StreamFailure):
                 error = stream.error
+                if error.is_context_overflow() and overflow_attempts < MAX_OVERFLOW_ATTEMPTS:
+                    # HARD overflow recovery (off the normal path): the prompt was
+                    # rejected wholesale, so the cache is already lost — compact
+                    # more aggressively and retry the SAME round. The ONLY
+                    # in-round compaction, and only after a real provider
+                    # rejection — pressure never triggers it here.
+                    self._rt.emit(
+                        ev.Warning(
+                            f"context overflow on round {round_no} "
+                            f"(attempt {overflow_attempts}); compacting and retrying"
+                        )
+                    )
+                    await self._run_compaction(convo, OverflowTrigger(attempt=overflow_attempts))
+                    overflow_attempts += 1
+                    round_no -= 1
+                    continue
                 if error.http_status == 429:
                     outcome = await self._handle_rate_limit(
                         cancel, convo, ctx, error, stream.partial, suppress, rate_limit_waits
@@ -735,6 +891,7 @@ class _Session:
             provider_retry = 0
             stream_retry = 0
             rate_limit_waits = 0
+            overflow_attempts = 0
 
             # ── empty-200 fast retry: a content-free Done is NOT the model
             # choosing to stop — keyed on RAW provider content, so a redacting
@@ -910,6 +1067,7 @@ class _Session:
             # offer_continuation so a discipline hook can't pre-empt finishing. ──
             if truncated and truncation_continuations < MAX_TRUNCATION_CONTINUATIONS:
                 truncation_continuations += 1
+                await self._maybe_compact_internal(convo, compaction_stages_attempted)
                 convo.push(Message.synthetic_user(TRUNCATION_RESUME_NUDGE))
                 continue
 
@@ -930,6 +1088,7 @@ class _Session:
                     await self._finish_turn(convo, StopReason.MAX_CONTINUATIONS, ctx)
                     return
                 continuations += 1
+                await self._maybe_compact_internal(convo, compaction_stages_attempted)
                 active_internal = (continuation.kind, continuation.visibility)
                 convo.push(Message.synthetic_user(continuation.text))
                 continue

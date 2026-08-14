@@ -12,6 +12,8 @@ from turnstile.kernel.dtos import (
     AfterOutcome,
     BeforeOutcome,
     ChatOptions,
+    CompactionPlan,
+    CompactionView,
     Conversation,
     Done,
     Message,
@@ -31,6 +33,7 @@ from turnstile.kernel.ports import (
     Clock,
     CompactionCheckpoint,
     CompactionCheckpointError,
+    CompactionStrategy,
     LifecycleHooks,
     LlmProvider,
     Tool,
@@ -478,6 +481,33 @@ class AsyncFnMiddleware(ToolMiddleware):
 
     async def before(self, call: ToolCall, tool: Tool, rt) -> BeforeOutcome:
         return await self._before_fn(call, tool, rt)
+
+
+# ── compaction strategy ────────────────────────────────────────────────
+
+
+class SummarizeOldestStrategy(CompactionStrategy):
+    """Drains everything between the sacred floor and the last `keep_recent`
+    messages into ONE summary message. will_summarize=True whenever it would
+    actually drain (drives the CompactionStarted progress event)."""
+
+    def __init__(self, keep_recent: int = 2, summary: str = "[compressed history]") -> None:
+        self._keep_recent = keep_recent
+        self._summary = summary
+
+    def _drain_range(self, view: CompactionView) -> tuple[int, int]:
+        drain_to = max(len(view.messages) - self._keep_recent, view.sacred_floor)
+        return (view.sacred_floor, drain_to)
+
+    def will_summarize(self, view: CompactionView) -> bool:
+        drain_from, drain_to = self._drain_range(view)
+        return drain_to > drain_from
+
+    async def plan(self, view: CompactionView) -> CompactionPlan:
+        drain_from, drain_to = self._drain_range(view)
+        if drain_to <= drain_from:
+            return CompactionPlan()
+        return CompactionPlan(drain_from=drain_from, drain_to=drain_to, summary=self._summary)
 
 
 # ── checkpoint ─────────────────────────────────────────────────────────
