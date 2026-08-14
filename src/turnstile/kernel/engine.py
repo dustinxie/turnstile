@@ -32,6 +32,8 @@ from turnstile.kernel.dtos import (
     PromptRejected,
     ProviderError,
     Reasoning,
+    ReasoningBlock,
+    ReasoningSignature,
     ResponseId,
     ResponseModel,
     SessionSnapshot,
@@ -470,34 +472,57 @@ class _Session:
                 internal is not None and internal[1] is ContinuationVisibility.INTERNAL_CONTROL
             )
             started = self._a.clock.now_millis()
-            outcome = await self._consume_stream(
+            stream = await self._consume_stream(
                 messages, tool_defs, options, convo, ctx, suppress=suppress
             )
-            if outcome is None:
+            if stream is None:
                 return  # terminal already emitted
-            text, reasoning, calls, usage, truncated, response_id, response_model = outcome
+            text, reasoning, calls = stream.text, stream.reasoning, stream.calls
+            usage, truncated = stream.usage, stream.truncated
+
+            # MISROUTED-ANSWER promotion: some gateways put the whole answer into
+            # the reasoning channel and leave content empty. A stop-finish round
+            # with ONLY plain-text reasoning promotes it to the body — through the
+            # same on_text_delta seam a normal delta passes, so redaction holds.
+            # Signed-block rounds are excluded (promoting would desync the blocks).
+            if (
+                not text
+                and reasoning.strip()
+                and not calls
+                and not truncated
+                and not stream.reasoning_blocks
+            ):
+                promoted = await self._hooks.on_text_delta(reasoning)
+                if promoted:
+                    text = promoted
+                    reasoning = ""
+                    if not suppress:
+                        self._rt.emit(ev.TextDelta(promoted))
 
             finish_reason = "tool_calls" if calls else ("length" if truncated else "stop")
             window = self._a.provider.context_window()
             used = usage.prompt if usage.prompt > 0 else sum(m.estimate_tokens() for m in messages)
             assistant = Message.assistant(text, calls)
             assistant.reasoning = reasoning or None
+            assistant.reasoning_blocks = stream.reasoning_blocks
             if internal is not None and internal[0] is ContinuationKind.VERIFY_CADENCE:
                 # Control chatter stays out of user-visible history.
                 assistant.internal_origin = "verify_cadence"
                 assistant.text = ""
                 assistant.reasoning = None
+                assistant.reasoning_blocks = []
             assistant.meta = MessageMeta(
                 tokens=usage,
                 elapsed_ms=self._a.clock.now_millis() - started,
+                reasoning_elapsed_ms=stream.reasoning_elapsed_ms,
                 ctx_window=window,
                 used_tokens=used,
                 utilization=(used / window) if window > 0 else 0.0,
                 round=round_no,
                 turn_id=turn_id,
                 request_id=ctx.request_id,
-                provider_response_id=response_id,
-                provider_model=response_model,
+                provider_response_id=stream.response_id,
+                provider_model=stream.response_model,
                 session_id=self._a.session_id,
                 finish_reason=finish_reason,
             )
@@ -603,37 +628,68 @@ class _Session:
 
     async def _consume_stream(
         self, messages, tool_defs, options, convo, ctx, suppress: bool = False
-    ):
+    ) -> "_RoundStream | None":
         """One provider call: open + consume. Returns the round's accumulation,
         or None if a terminal was already emitted. suppress=True (an
         INTERNAL_CONTROL continuation round) keeps text/reasoning off the live
         stream AND out of the accumulation — control chatter is invisible.
         Retry tiers land later — today any provider failure is a clean
         PROVIDER_ERROR."""
+        out = _RoundStream()
         text_parts: list[str] = []
         reasoning_parts: list[str] = []
-        calls: list = []
-        usage = TokenUsage()
-        truncated = False
-        response_id: str | None = None
-        response_model: str | None = None
+        block_parts: list[str] = []  # buffer for the CURRENT signed block
+        reasoning_started: int | None = None
+
+        def _close_reasoning_phase() -> None:
+            nonlocal reasoning_started
+            if reasoning_started is not None:
+                out.reasoning_elapsed_ms += self._a.clock.now_millis() - reasoning_started
+                reasoning_started = None
+
         try:
             stream = self._a.provider.chat_stream(messages, tool_defs, options)
             async for event in stream:
                 match event:
                     case TextDelta(text=delta):
+                        out.saw_content = True  # RAW arrival, before any hook —
+                        _close_reasoning_phase()  # a clearing hook != empty 200
                         delta = await self._hooks.on_text_delta(delta)
                         if delta and not suppress:
                             text_parts.append(delta)
                             self._rt.emit(ev.TextDelta(delta))
                     case Reasoning(text=delta):
+                        out.saw_content = True
+                        if reasoning_started is None:
+                            reasoning_started = self._a.clock.now_millis()
                         delta = await self._hooks.on_reasoning_delta(delta)
                         if delta and not suppress:
                             reasoning_parts.append(delta)
-                            self._rt.emit(ev.Reasoning(delta))
+                            block_parts.append(delta)  # post-hook bytes: a stored
+                            self._rt.emit(ev.Reasoning(delta))  # block stays redacted
+                    case ReasoningSignature(opaque=opaque, provider=provider):
+                        # Finalize ONE signed block: the text since the previous
+                        # boundary. A redacted block has no preceding deltas ->
+                        # empty text. Pure storage — the text already streamed.
+                        out.saw_content = True
+                        if reasoning_started is None:
+                            reasoning_started = self._a.clock.now_millis()
+                        if not suppress:
+                            out.reasoning_blocks.append(
+                                ReasoningBlock(
+                                    text="".join(block_parts),
+                                    opaque=opaque,
+                                    provider=provider,
+                                )
+                            )
+                            block_parts.clear()
                     case ToolCallEvent(call=call):
-                        calls.append(call)
+                        out.saw_content = True
+                        _close_reasoning_phase()
+                        out.calls.append(call)
                     case ToolCallDelta():
+                        out.saw_content = True
+                        _close_reasoning_phase()
                         self._rt.emit(
                             ev.ToolCallStreaming(
                                 index=event.index,
@@ -643,31 +699,27 @@ class _Session:
                             )
                         )
                     case UsageEvent(usage=u):
-                        usage.merge_max(u)
+                        out.usage.merge_max(u)
                     case ResponseId(id=rid):
-                        response_id = rid
+                        out.response_id = rid
                     case ResponseModel(model=model):
-                        response_model = model
+                        out.response_model = model
                     case ErrorEvent(error=error):
                         await self._fail_provider(convo, ctx, error)
                         return None
                     case Malformed():
-                        pass  # diagnostic only; empty-retry flavor lands later
+                        out.saw_malformed = True  # diagnostic: flavors the
+                        # empty-response retry wording (resilience commit)
                     case Done(truncated=t):
-                        truncated = t
+                        out.truncated = t
                         break
         except ProviderError as error:
             await self._fail_provider(convo, ctx, error)
             return None
-        return (
-            "".join(text_parts),
-            "".join(reasoning_parts),
-            calls,
-            usage,
-            truncated,
-            response_id,
-            response_model,
-        )
+        _close_reasoning_phase()
+        out.text = "".join(text_parts)
+        out.reasoning = "".join(reasoning_parts)
+        return out
 
     async def _fail_provider(self, convo, ctx, error: ProviderError) -> None:
         await self._hooks.on_error(error.message)
@@ -947,6 +999,26 @@ def _tool_def(tool: Tool) -> ToolDef:
         description=tool.description(),
         parameters=tool.parameters_schema(),
     )
+
+
+@dataclass
+class _RoundStream:
+    """One round's accumulated stream: post-hook text/reasoning, signed blocks,
+    calls, usage, and the RAW-content flags the retry tiers key on."""
+
+    text: str = ""
+    reasoning: str = ""
+    reasoning_blocks: list[ReasoningBlock] = field(default_factory=list)
+    calls: list[ToolCall] = field(default_factory=list)
+    usage: TokenUsage = field(default_factory=TokenUsage)
+    truncated: bool = False
+    response_id: str | None = None
+    response_model: str | None = None
+    reasoning_elapsed_ms: int = 0
+    # Did the PROVIDER stream any content (pre-hook)? A redacting hook that
+    # clears every chunk must not make a real response look like an empty 200.
+    saw_content: bool = False
+    saw_malformed: bool = False
 
 
 # ── dispatch plan variants (Phase ① output) ────────────────────────────
