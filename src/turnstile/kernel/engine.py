@@ -10,6 +10,7 @@ TODO(M1): full tool dispatch (II.3), remaining fuses (II.6), streaming seams
 """
 
 import asyncio
+import json
 from collections import deque
 from dataclasses import dataclass, field, replace
 
@@ -20,10 +21,12 @@ from turnstile.kernel.dtos import (
     Conversation,
     Done,
     ErrorEvent,
+    Gate,
     Malformed,
     ManualTrigger,
     Message,
     MessageMeta,
+    ProgressSink,
     PromptRejected,
     ProviderError,
     Reasoning,
@@ -79,6 +82,12 @@ class Agent:
     # SAFETY FUSE, defaults ON: an offer_continuation hook that always continues
     # is an infinite kernel-driven loop with no model agency to stop it.
     max_continuations: int | None = 50
+    # Phase-② concurrency cap for parallel-safe tools (side-effecting tools
+    # always serialize regardless).
+    max_parallel_tools: int = 4
+    # Byte cap on a single tool result's content — the kernel's ONE built-in
+    # safety bound (context bloat). 0 = unbounded.
+    max_tool_result_bytes: int = 64 * 1024
     compaction: CompactionStrategy = field(default_factory=NoCompaction)
     checkpoint: CompactionCheckpoint | None = None
     chat_options: ChatOptions = field(default_factory=ChatOptions)
@@ -377,16 +386,10 @@ class _Session:
             convo.push(assistant)
 
             if calls:
-                # Degenerate dispatch (full three-phase lands next commit):
-                # every call resolves; unknown tools produce error results.
-                for call in calls:
-                    result = await self._execute_unknown(call, tools)
-                    if result.is_error:
-                        await self._hooks.on_error(result.content)
-                    self._rt.emit(ev.ToolResultEvent(result))
-                    convo.push(
-                        Message.tool_result(result.call_id, result.content, result.is_error)
-                    )
+                stop = await self._dispatch_tools(convo, calls, tools, turn_id, round_no)
+                if stop is not None:
+                    await self._finish_turn(convo, stop, ctx)
+                    return
                 continue
 
             continuation = await self._hooks.offer_typed_continuation(convo)
@@ -486,25 +489,240 @@ class _Session:
         )
         await self._finish_turn(convo, StopReason.PROVIDER_ERROR, ctx)
 
-    async def _execute_unknown(self, call: ToolCall, tools: dict[str, Tool]) -> ToolResult:
-        tool = tools.get(call.name)
-        if tool is None:
-            return ToolResult(
-                call_id=call.id,
-                content=f"unknown or unmounted tool: {call.name}",
-                is_error=True,
+    # ── tool dispatch: three phases (II.3) ────────────────────────────
+
+    async def _dispatch_tools(
+        self,
+        convo: Conversation,
+        calls: list[ToolCall],
+        tools: dict[str, Tool],
+        turn_id: int,
+        round_no: int,
+    ) -> StopReason | None:
+        """① classify → ② execute (concurrent) → ③ apply (in order).
+        Returns POLICY_DENIED when a DENY_TURN middleware fired, else None."""
+        # ── Phase ① CLASSIFY (in emission order) ──
+        plans: list[_Skip | _Ready | _Execute] = []
+        result_ids: set[str] = set()  # call_ids already resulted this batch (mode A)
+        seen_calls: set[tuple[str, str]] = set()  # executed (name, canonical args) (mode B)
+        deny_turn_seen = False
+        for call in calls:
+            # Dedup keys use the MODEL's original bytes, captured BEFORE any
+            # middleware rewrite: two model-identical calls are duplicates
+            # regardless of what middleware would later do to them.
+            dedup_key = (call.name, _canonicalize_args(call.arguments))
+            if call.id in result_ids:
+                # Mode A: a second result for one id is an illegal payload — skip
+                # ENTIRELY (no execute, no result row, nothing to repair).
+                plans.append(_Skip())
+                continue
+            if deny_turn_seen:
+                result_ids.add(call.id)
+                plans.append(
+                    _Ready(
+                        ToolResult(
+                            call_id=call.id,
+                            content="blocked: another call in this batch terminated the turn by policy",
+                            is_error=True,
+                        )
+                    )
+                )
+                continue
+            if dedup_key in seen_calls:
+                # Mode B: same tool+args under a NEW id — don't re-execute; a stub
+                # keeps this id paired (API-valid) without repeating side effects.
+                result_ids.add(call.id)
+                plans.append(
+                    _Ready(
+                        ToolResult(
+                            call_id=call.id,
+                            content="[duplicate call — identical tool and arguments to an "
+                            "earlier call this turn; result already returned above]",
+                        )
+                    )
+                )
+                continue
+            tool = tools.get(call.name)
+            if tool is None:
+                result_ids.add(call.id)  # id paired; (name,args) NOT recorded — a
+                plans.append(
+                    _Ready(
+                        ToolResult(  # later retry may legitimately run
+                            call_id=call.id,
+                            content=f"unknown or unmounted tool: {call.name}",
+                            is_error=True,
+                        )
+                    )
+                )
+                continue
+            blocked: tuple[str, bool] | None = None
+            for mw in self._a.middleware:
+                outcome = await mw.before(call, tool, self._rt)
+                if outcome.gate is Gate.ALLOW:
+                    break  # force-approve: skip remaining gates
+                if outcome.gate is Gate.DENY:
+                    blocked = (outcome.reason, False)
+                    break
+                if outcome.gate is Gate.DENY_TURN:
+                    blocked = (outcome.reason, True)
+                    break
+                # PROCEED and ASK both continue the chain: the kernel owns no
+                # prompt — a bare ASK defers to a downstream approval middleware.
+            if blocked is not None:
+                reason, terminate = blocked
+                result_ids.add(call.id)
+                plans.append(
+                    _Ready(
+                        ToolResult(call_id=call.id, content=f"blocked: {reason}", is_error=True),
+                        terminate_turn=terminate,
+                    )
+                )
+                if terminate:
+                    deny_turn_seen = True
+                    for i, prior in enumerate(plans[:-1]):
+                        if isinstance(prior, _Execute):
+                            plans[i] = _Ready(
+                                ToolResult(
+                                    call_id=prior.call.id,
+                                    content="blocked: another call in this batch "
+                                    "terminated the turn by policy",
+                                    is_error=True,
+                                )
+                            )
+                continue
+            result_ids.add(call.id)
+            seen_calls.add(dedup_key)
+            plans.append(
+                _Execute(tool=tool, call=call, parallel_safe=tool.parallel_safe(call.arguments))
             )
-        tctx = ToolContext(working_dir=self._a.working_dir, requester=self._rt.requester())
-        try:
-            result = await tool.execute(call.arguments, tctx)
-        except Exception as error:  # noqa: BLE001 — trust model: ANY tool failure becomes data
-            return ToolResult(
-                call_id=call.id,
-                content=f"{type(error).__name__}: {error}",
-                is_error=True,
+
+        # ── Batch perception: >= 2 non-duplicate calls -> grouped block ──
+        distinct = len(result_ids)
+        batch_id: str | None = None
+        batch_started_at = 0
+        if distinct >= 2:
+            batch_id = f"batch_{turn_id}_{round_no}"
+            batch_started_at = self._a.clock.now_millis()
+            self._rt.emit(
+                ev.ToolBatchStarted(
+                    batch_id=batch_id,
+                    calls=[
+                        ev.ToolBatchCall(
+                            id=p.call.id,
+                            name=p.call.name,
+                            arguments=p.call.arguments,
+                            parallel_safe=p.parallel_safe,
+                        )
+                        for p in plans
+                        if isinstance(p, _Execute)
+                    ],
+                )
             )
-        result.call_id = call.id
-        return result
+
+        # ── Phase ② EXECUTE ──
+        # Consecutive parallel-safe plans run concurrently (bounded by the
+        # semaphore); a side-effecting plan is an exclusive barrier. Results land
+        # in plan order either way, so Phase ③ applies in emission order.
+        results: list[ToolResult | None] = [
+            p.result if isinstance(p, _Ready) else None for p in plans
+        ]
+        semaphore = asyncio.Semaphore(max(1, self._a.max_parallel_tools))
+        i = 0
+        while i < len(plans):
+            plan = plans[i]
+            if not isinstance(plan, _Execute):
+                i += 1
+                continue
+            if plan.parallel_safe:
+                group: list[tuple[int, _Execute]] = [(i, plan)]
+                j = i + 1
+                while j < len(plans):
+                    nxt = plans[j]
+                    if isinstance(nxt, _Execute) and not nxt.parallel_safe:
+                        break  # a writer closes the concurrent window
+                    if isinstance(nxt, _Execute):
+                        group.append((j, nxt))
+                    j += 1
+                gathered = await asyncio.gather(
+                    *[self._execute_one(execute, semaphore) for _, execute in group]
+                )
+                for (k, _), result in zip(group, gathered, strict=True):
+                    results[k] = result
+                i = j
+            else:
+                results[i] = await self._execute_one(plan, semaphore)
+                i += 1
+
+        # ── Phase ③ APPLY (in order) ──
+        policy_denied = False
+        batch_ok = 0
+        lifted_images: list = []
+        for plan, result in zip(plans, results, strict=True):
+            if isinstance(plan, _Skip) or result is None:
+                continue
+            post_block: str | None = None
+            for mw in self._a.middleware:
+                after = await mw.after(result)  # sees the RAW, pre-cap result
+                if after.block_reason is not None and post_block is None:
+                    post_block = after.block_reason
+            _cap_tool_result(result, self._a.max_tool_result_bytes)
+            if result.is_error:
+                await self._hooks.on_error(result.content)
+            elif batch_id is not None:
+                batch_ok += 1
+            if result.images:
+                lifted_images.extend(result.images)
+                result.images = []  # transient: never stored on the tool message
+            self._rt.emit(ev.ToolResultEvent(result))
+            convo.push(Message.tool_result(result.call_id, result.content, result.is_error))
+            if post_block is not None:
+                convo.push(Message.synthetic_user(post_block))
+            if isinstance(plan, _Ready) and plan.terminate_turn:
+                policy_denied = True
+
+        if batch_id is not None:
+            self._rt.emit(
+                ev.ToolBatchCompleted(
+                    batch_id=batch_id,
+                    ok=batch_ok,
+                    total=distinct,
+                    elapsed_ms=self._a.clock.now_millis() - batch_started_at,
+                )
+            )
+        if lifted_images:
+            # Providers reject images on the tool role: ONE synthetic user message
+            # after all results keeps the assistant's calls contiguous (API-valid).
+            convo.push(
+                Message.synthetic_user(
+                    "[Images returned by the tool calls above are attached for you to view.]",
+                    images=lifted_images,
+                )
+            )
+        return StopReason.POLICY_DENIED if policy_denied else None
+
+    async def _execute_one(self, plan: "_Execute", semaphore: asyncio.Semaphore) -> ToolResult:
+        async with semaphore:
+            call = plan.call
+            self._rt.emit(ev.ToolStarted(call))
+            tctx = ToolContext(
+                working_dir=self._a.working_dir,
+                progress=ProgressSink(
+                    lambda message, call_id=call.id: self._rt.emit(
+                        ev.ToolProgress(call_id=call_id, message=message)
+                    )
+                ),
+                requester=self._rt.requester(),
+            )
+            try:
+                result = await plan.tool.execute(call.arguments, tctx)
+            except Exception as error:  # noqa: BLE001 — trust model: ANY tool failure becomes data
+                return ToolResult(
+                    call_id=call.id,
+                    content=f"{type(error).__name__}: {error}",
+                    is_error=True,
+                )
+            result.call_id = call.id
+            return result
 
 
 def _tool_def(tool: Tool) -> ToolDef:
@@ -512,4 +730,58 @@ def _tool_def(tool: Tool) -> ToolDef:
         name=tool.name(),
         description=tool.description(),
         parameters=tool.parameters_schema(),
+    )
+
+
+# ── dispatch plan variants (Phase ① output) ────────────────────────────
+
+
+@dataclass
+class _Skip:
+    """Mode-A duplicate (same call_id already resulted) — no result row at all."""
+
+
+@dataclass
+class _Ready:
+    """A ready-to-apply result: mode-B stub, middleware block, or unknown tool."""
+
+    result: ToolResult
+    terminate_turn: bool = False
+
+
+@dataclass
+class _Execute:
+    """Runs in Phase ②. parallel_safe captured at classification time."""
+
+    tool: Tool
+    call: ToolCall
+    parallel_safe: bool
+
+
+def _canonicalize_args(arguments: str) -> str:
+    """Call-identity canonicalization: object-key order and insignificant
+    whitespace don't change identity; array order and malformed input still do."""
+    try:
+        return json.dumps(json.loads(arguments), sort_keys=True, separators=(",", ":"))
+    except (ValueError, TypeError):
+        return arguments
+
+
+def _cap_tool_result(result: ToolResult, max_bytes: int) -> None:
+    """Enforce the kernel's tool-result size cap IN PLACE: keep head + tail
+    (signal usually lives at both ends), splice an elision marker between.
+    Deterministic — same content + cap → byte-identical output (prefix-cache
+    safe). max_bytes == 0 disables (unbounded)."""
+    if max_bytes == 0:
+        return
+    raw = result.content.encode("utf-8")
+    total = len(raw)
+    if total <= max_bytes:
+        return
+    half = max_bytes // 2
+    head = raw[:half].decode("utf-8", errors="ignore")
+    tail = raw[total - half :].decode("utf-8", errors="ignore")
+    elided = total - len(head.encode("utf-8")) - len(tail.encode("utf-8"))
+    result.content = (
+        f"{head}\n…[truncated: {elided} of {total} bytes elided by kernel cap]…\n{tail}"
     )
