@@ -17,6 +17,7 @@ from dataclasses import dataclass, field, replace
 from turnstile.kernel import events as ev
 from turnstile.kernel.dtos import (
     SNAPSHOT_VERSION,
+    CancellationToken,
     ChatOptions,
     ContinuationKind,
     ContinuationVisibility,
@@ -146,6 +147,17 @@ def _effective_retry_after(error: ProviderError) -> int | None:
     return int(digits) if digits else None
 
 
+INTERRUPTION_MARKER = (
+    "[The previous response was interrupted by the user before completing. "
+    "Reconsider the approach in light of this interruption before continuing.]"
+)
+
+
+class _TurnCancelled(Exception):
+    """Internal control flow: a cancel checkpoint fired mid-turn. Caught by
+    _run_turn's single handler, which funnels into the cancel terminal."""
+
+
 # ── loop fuses (II.6) ──────────────────────────────────────────────────
 
 # Always-on coarse repetition fuse: same model-emitted call pattern for too many
@@ -252,6 +264,12 @@ class Agent:
     resume: SessionSnapshot | None = None
     working_dir: str = "."
     request_timeout: float | None = None
+    # Cancel semantics: False (default) = CANCEL IS UNDO — the cancelled turn
+    # rolls back to before its user message, leaving no trace. True = preserve
+    # partial work (dangling calls backfilled '(cancelled)', an interruption
+    # marker appended) — the right choice for a chatbot service where losing the
+    # user's message on a flaky network is worse than keeping a half answer.
+    keep_interrupted_context: bool = False
     # LIVENESS: max seconds to wait for the NEXT stream event (bounds first-token
     # AND inter-token latency). None = unbounded. Production should set it.
     stream_timeout: float | None = None
@@ -436,6 +454,9 @@ class _Session:
             # A REAL user submission starts a new intent scope; synthetic
             # continuations keep the accumulated exact-loop evidence.
             self._tool_loop_state.reset()
+        # CANCEL = UNDO rollback point: history length BEFORE this turn pushed
+        # anything (context and prompt roll back together).
+        rollback_len = len(convo.messages)
         if context is not None:  # host-owned context rides the SAME turn
             convo.push(Message.synthetic_user(context))
         if synthetic:
@@ -443,7 +464,9 @@ class _Session:
         else:
             convo.push(Message.user(text, images=images))
 
-        turn = asyncio.create_task(self._run_turn(convo))
+        cancel = CancellationToken()  # per-turn; every await races against it
+        steer: deque[ev.SteeredInput] = deque()  # mid-turn prompts fold in here
+        turn = asyncio.create_task(self._run_turn(convo, cancel, rollback_len, steer))
         shutdown = False
         while not turn.done():
             getter = self._getter(commands)
@@ -455,13 +478,32 @@ class _Session:
                     case ev.Respond(id=rid, value=value):
                         self._rt.resolve(rid, value)
                     case ev.Cancel():
-                        self._rt.cancel_pending()  # TODO(cancel commit): turn token
-                    case ev.Shutdown():
-                        shutdown = True
+                        # Both halves of a parked turn: the token covers stream /
+                        # tools / sleeps; flushing pending requests (fail-closed
+                        # None) unblocks a middleware approval round-trip the
+                        # token cannot reach. A cancelled turn's queued steers
+                        # die with it.
+                        cancel.cancel()
                         self._rt.cancel_pending()
+                        steer.clear()
+                    case ev.Shutdown():
+                        # Cooperative terminal, never a dropped future: the turn
+                        # funnels through its normal cancel path first.
+                        shutdown = True
+                        cancel.cancel()
+                        self._rt.cancel_pending()
+                        steer.clear()
+                    case ev.SendMessage(text=steer_text, images=steer_images):
+                        # Mid-turn user prompt STEERS the running turn (folded at
+                        # the next round boundary) instead of queueing a 2nd turn.
+                        steer.append(ev.SteeredInput(text=steer_text, images=steer_images))
                     case other:
                         pending.append(other)
         await turn
+        # Steers that arrived too late for any round boundary must not vanish:
+        # they become ordinary queued prompts.
+        for leftover in steer:
+            pending.append(ev.SendMessage(text=leftover.text, images=leftover.images))
         return shutdown
 
     # ── the turn ──────────────────────────────────────────────────────
@@ -471,7 +513,41 @@ class _Session:
         await self._hooks.turn_complete(convo, reason, ctx)
         self._rt.emit(ev.TurnComplete(reason))
 
-    async def _run_turn(self, convo: Conversation) -> None:
+    async def _run_turn(
+        self,
+        convo: Conversation,
+        cancel: CancellationToken,
+        rollback_len: int,
+        steer: "deque[ev.SteeredInput]",
+    ) -> None:
+        try:
+            await self._run_turn_rounds(convo, cancel, rollback_len, steer)
+        except _TurnCancelled as cancelled:
+            await self._finish_cancelled(convo, rollback_len, cancelled.args[0])
+
+    async def _finish_cancelled(
+        self, convo: Conversation, rollback_len: int, ctx: TurnCtx
+    ) -> None:
+        """The cancel funnel — every checkpoint lands here exactly once."""
+        if self._a.keep_interrupted_context:
+            # PRESERVE: keep partial work; pair every dangling call so the wire
+            # stays API-valid; a synthetic user-role marker (wire-safe on all
+            # adapters, skipped by sacred_floor) tells the model what happened.
+            convo.backfill_cancelled_tool_results()
+            convo.push(Message.synthetic_user(INTERRUPTION_MARKER))
+        else:
+            # UNDO (default): the prompt + all partial work leave no trace.
+            del convo.messages[rollback_len:]
+        self._rt.emit(ev.Cancelled())
+        await self._finish_turn(convo, StopReason.CANCELLED, ctx)
+
+    async def _run_turn_rounds(
+        self,
+        convo: Conversation,
+        cancel: CancellationToken,
+        rollback_len: int,
+        steer: "deque[ev.SteeredInput]",
+    ) -> None:
         await self._hooks.turn_start(convo)
         self._rt.emit(ev.TurnStarted())
         tools = dict(self._a.tools)  # per-turn snapshot of the mounted set
@@ -514,6 +590,23 @@ class _Session:
                 context_window=ctx_window,
                 used_tokens=used_tokens,
             )
+            if cancel.is_cancelled:  # between-rounds checkpoint
+                raise _TurnCancelled(ctx)
+            # ── STEER: fold mid-turn user prompts into THIS turn before the next
+            # request — real user messages, append-only. A steer changes the
+            # turn's intent, so repetition evidence resets.
+            if steer:
+                folded: list[ev.SteeredInput] = []
+                while steer:
+                    folded.append(steer.popleft())
+                for item in folded:
+                    convo.push(Message.user(item.text, images=list(item.images)))
+                self._rt.emit(ev.Steered(count=len(folded), inputs=folded))
+                if self._tool_loop_state is not None:
+                    self._tool_loop_state.reset()
+                repeat_sig = None
+                repeat_rounds = 0
+                repeat_nudged = False
             if round_cap is not None and round_no > round_cap:
                 if self._a.round_cap_checkpoint:
                     answer = await self._rt.request(
@@ -563,7 +656,9 @@ class _Session:
                 internal is not None and internal[1] is ContinuationVisibility.INTERNAL_CONTROL
             )
             started = self._a.clock.now_millis()
-            stream = await self._consume_stream(messages, tool_defs, options, suppress=suppress)
+            stream = await self._consume_stream(
+                messages, tool_defs, options, cancel, ctx, suppress=suppress
+            )
 
             # ── liveness timeout: reconnect while content-free, else fail ──
             if isinstance(stream, _StreamTimeout):
@@ -575,7 +670,7 @@ class _Session:
                             f"({stream_retry}/{MAX_STREAM_RETRIES})"
                         )
                     )
-                    await self._sleep(min(0.2 * (2 ** (stream_retry - 1)), 8.0))
+                    await self._sleep(min(0.2 * (2 ** (stream_retry - 1)), 8.0), cancel, ctx)
                     round_no -= 1  # a RETRY of the same logical round
                     continue
                 if stream.partial.saw_content:
@@ -597,7 +692,7 @@ class _Session:
                 error = stream.error
                 if error.http_status == 429:
                     outcome = await self._handle_rate_limit(
-                        convo, ctx, error, stream.partial, suppress, rate_limit_waits
+                        cancel, convo, ctx, error, stream.partial, suppress, rate_limit_waits
                     )
                     if outcome is None:
                         return  # terminal emitted (pause / fuse / post-content)
@@ -614,7 +709,7 @@ class _Session:
                             f"({provider_retry}/{MAX_PROVIDER_RETRIES})"
                         )
                     )
-                    await self._sleep(wait)
+                    await self._sleep(wait, cancel, ctx)
                     round_no -= 1
                     continue
                 if stream.partial.saw_content:
@@ -645,7 +740,7 @@ class _Session:
                             f"({empty_retries}/{EMPTY_RESPONSE_MAX_RETRIES})"
                         )
                     )
-                    await self._sleep(min((empty_retries + 1) // 2, 3))
+                    await self._sleep(min((empty_retries + 1) // 2, 3), cancel, ctx)
                     round_no -= 1
                     continue
                 message = (
@@ -714,11 +809,20 @@ class _Session:
 
             if calls:
                 stop, fingerprint = await self._dispatch_tools(
-                    convo, calls, tools, turn_id, round_no
+                    cancel, ctx, convo, calls, tools, turn_id, round_no
                 )
                 if stop is not None:
                     await self._finish_turn(convo, stop, ctx)
                     return
+                if steer:
+                    # A pending steer is real user intent: honor it before any
+                    # repetition verdict — the evidence chain resets anyway.
+                    if self._tool_loop_state is not None:
+                        self._tool_loop_state.reset()
+                    repeat_sig = None
+                    repeat_rounds = 0
+                    repeat_nudged = False
+                    continue
 
                 # ── exact no-progress guard (opt-in; owns the streak) ──
                 exact_active = False
@@ -783,6 +887,11 @@ class _Session:
             repeat_rounds = 0
             repeat_nudged = False
 
+            # A prompt steered in during this round keeps the turn alive: loop
+            # back so the round-top drain folds it in and the model answers it.
+            if steer:
+                continue
+
             # ── truncation auto-continuation: output cut at the token limit
             # with no tool call is almost always unfinished work. Runs BEFORE
             # offer_continuation so a discipline hook can't pre-empt finishing. ──
@@ -824,12 +933,16 @@ class _Session:
         messages,
         tool_defs,
         options,
+        cancel: CancellationToken,
+        ctx: TurnCtx,
         suppress: bool = False,
     ) -> "_RoundStream | _StreamFailure | _StreamTimeout":
         """One provider call: open + consume. Emits NO terminals — failures and
-        timeouts return typed outcomes for _run_turn's retry policy to judge.
-        suppress=True (an INTERNAL_CONTROL continuation round) keeps
-        text/reasoning off the live stream AND out of the accumulation."""
+        timeouts return typed outcomes for _run_turn's retry policy to judge;
+        a cancel mid-stream raises _TurnCancelled (nothing dangles: the round's
+        accumulation is discarded, the funnel repairs history). suppress=True
+        (an INTERNAL_CONTROL continuation round) keeps text/reasoning off the
+        live stream AND out of the accumulation."""
         out = _RoundStream()
         text_parts: list[str] = []
         reasoning_parts: list[str] = []
@@ -849,18 +962,28 @@ class _Session:
             out.reasoning = "".join(reasoning_parts)
 
         iterator = aiter(self._a.provider.chat_stream(messages, tool_defs, options))
+        cancel_wait = asyncio.ensure_future(cancel.cancelled())
         try:
             while True:
-                try:
-                    if self._a.stream_timeout is not None:
-                        event = await asyncio.wait_for(anext(iterator), self._a.stream_timeout)
-                    else:
-                        event = await anext(iterator)
-                except StopAsyncIteration:
-                    break
-                except TimeoutError:
+                # Race the next event against cancel and the liveness timeout —
+                # every await inside the stream is bounded and cancellable.
+                next_event = asyncio.ensure_future(anext(iterator))
+                done, _ = await asyncio.wait(
+                    {next_event, cancel_wait},
+                    timeout=self._a.stream_timeout,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if cancel_wait in done:
+                    next_event.cancel()
+                    raise _TurnCancelled(ctx)
+                if not done:  # liveness timeout: no event within stream_timeout
+                    next_event.cancel()
                     _finalize()
                     return _StreamTimeout(partial=out)
+                try:
+                    event = next_event.result()
+                except StopAsyncIteration:
+                    break
                 except ProviderError as error:
                     _finalize()
                     return _StreamFailure(error=error, opened=opened, partial=out)
@@ -928,7 +1051,7 @@ class _Session:
                         out.truncated = t
                         break
         finally:
-            pass
+            cancel_wait.cancel()  # never leak the parked waiter
         _finalize()
         return out
 
@@ -943,9 +1066,16 @@ class _Session:
         )
         await self._finish_turn(convo, StopReason.PROVIDER_ERROR, ctx)
 
-    async def _sleep(self, seconds: float) -> None:
-        """Every retry/backoff wait, scaled — tests set backoff_scale=0."""
-        await asyncio.sleep(seconds * self._a.backoff_scale)
+    async def _sleep(self, seconds: float, cancel: CancellationToken, ctx: TurnCtx) -> None:
+        """Every retry/backoff wait, scaled (tests set backoff_scale=0) and raced
+        against cancel so Esc never sits out a backoff."""
+        sleep = asyncio.ensure_future(asyncio.sleep(seconds * self._a.backoff_scale))
+        cancel_wait = asyncio.ensure_future(cancel.cancelled())
+        done, _ = await asyncio.wait({sleep, cancel_wait}, return_when=asyncio.FIRST_COMPLETED)
+        sleep.cancel()
+        cancel_wait.cancel()
+        if cancel_wait in done:
+            raise _TurnCancelled(ctx)
 
     def _persist_partial(
         self, convo: Conversation, partial: "_RoundStream", suppress: bool
@@ -970,6 +1100,7 @@ class _Session:
 
     async def _handle_rate_limit(
         self,
+        cancel: CancellationToken,
         convo: Conversation,
         ctx: TurnCtx,
         error: ProviderError,
@@ -1026,7 +1157,7 @@ class _Session:
             return None
         quiet_first = verdict is None and hint.retry_after_secs is None and waits == 1
         if quiet_first:  # a one-off burst clears without banner spam
-            await self._sleep(SILENT_FIRST_RATE_LIMIT_WAIT)
+            await self._sleep(SILENT_FIRST_RATE_LIMIT_WAIT, cancel, ctx)
         else:
             self._rt.emit(
                 ev.RateLimited(
@@ -1034,13 +1165,15 @@ class _Session:
                     auto_resuming=True,
                 )
             )
-            await self._sleep(decision.wait_secs)
+            await self._sleep(decision.wait_secs, cancel, ctx)
         return waits
 
     # ── tool dispatch: three phases (II.3) ────────────────────────────
 
     async def _dispatch_tools(
         self,
+        cancel: CancellationToken,
+        ctx: TurnCtx,
         convo: Conversation,
         calls: list[ToolCall],
         tools: dict[str, Tool],
@@ -1054,6 +1187,10 @@ class _Session:
         real execution or an all-parallel-safe batch, no stubs/blocks/images —
         else None (ineligible batches break the streak)."""
         # ── Phase ① CLASSIFY (in emission order) ──
+        # Cancel checkpoint before any classification/batch perception: nothing
+        # started, so nothing dangles — the funnel repairs the assistant message.
+        if cancel.is_cancelled:
+            raise _TurnCancelled(ctx)
         plans: list[_Skip | _Ready | _Execute] = []
         result_ids: set[str] = set()  # call_ids already resulted this batch (mode A)
         seen_calls: set[tuple[str, str]] = set()  # executed (name, canonical args) (mode B)
@@ -1196,13 +1333,13 @@ class _Session:
                         group.append((j, nxt))
                     j += 1
                 gathered = await asyncio.gather(
-                    *[self._execute_one(execute, semaphore) for _, execute in group]
+                    *[self._execute_one(execute, semaphore, cancel) for _, execute in group]
                 )
                 for (k, _), result in zip(group, gathered, strict=True):
                     results[k] = result
                 i = j
             else:
-                results[i] = await self._execute_one(plan, semaphore)
+                results[i] = await self._execute_one(plan, semaphore, cancel)
                 i += 1
 
         # ── Phase ③ APPLY (in order) ──
@@ -1270,15 +1407,28 @@ class _Session:
                     images=lifted_images,
                 )
             )
+        if cancel.is_cancelled:
+            # Results that DID complete were applied above (their events fired);
+            # now the cancel terminal takes over — the funnel repairs pairing.
+            raise _TurnCancelled(ctx)
         fingerprint = tuple(sorted(loop_entries)) if loop_eligible and loop_entries else None
         return (StopReason.POLICY_DENIED if policy_denied else None, fingerprint)
 
-    async def _execute_one(self, plan: "_Execute", semaphore: asyncio.Semaphore) -> ToolResult:
+    async def _execute_one(
+        self, plan: "_Execute", semaphore: asyncio.Semaphore, cancel: CancellationToken
+    ) -> ToolResult:
         async with semaphore:
             call = plan.call
+            if cancel.is_cancelled:  # cancelled while queued behind the semaphore
+                return ToolResult(
+                    call_id=call.id,
+                    content="(cancelled — never started)",
+                    is_error=True,
+                )
             self._rt.emit(ev.ToolStarted(call))
             tctx = ToolContext(
                 working_dir=self._a.working_dir,
+                cancel=cancel,  # cooperative: a long tool polls / awaits it
                 progress=ProgressSink(
                     lambda message, call_id=call.id: self._rt.emit(
                         ev.ToolProgress(call_id=call_id, message=message)
@@ -1286,14 +1436,32 @@ class _Session:
                 ),
                 requester=self._rt.requester(),
             )
+            # Race execute against cancel, execute-first biased: a tool that
+            # already completed keeps its real result. A tool still pending when
+            # cancel fires is dropped as a backstop — side effects unknown, and
+            # the synthetic result says so.
+            execute = asyncio.ensure_future(plan.tool.execute(call.arguments, tctx))
+            cancel_wait = asyncio.ensure_future(cancel.cancelled())
             try:
-                result = await plan.tool.execute(call.arguments, tctx)
+                done, _ = await asyncio.wait(
+                    {execute, cancel_wait}, return_when=asyncio.FIRST_COMPLETED
+                )
+                if execute not in done:
+                    execute.cancel()
+                    return ToolResult(
+                        call_id=call.id,
+                        content="(cancelled — side effects unknown)",
+                        is_error=True,
+                    )
+                result = execute.result()
             except Exception as error:  # noqa: BLE001 — trust model: ANY tool failure becomes data
                 return ToolResult(
                     call_id=call.id,
                     content=f"{type(error).__name__}: {error}",
                     is_error=True,
                 )
+            finally:
+                cancel_wait.cancel()
             result.call_id = call.id
             return result
 

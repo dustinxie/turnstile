@@ -280,12 +280,15 @@ async def test_exact_guard_resets_on_new_real_user_turn():
     )
     handle = agent.spawn()
     terminals = []
+    # Sequential sends: a SendMessage during a running turn would STEER into it
+    # (commit 10) — this test needs two distinct real-user turns.
     for text in ("q1", "q2"):
         await handle.commands.put(ev.SendMessage(text=text))
-    while len(terminals) < 2:
-        event = await handle.events.get()
-        if isinstance(event, ev.TurnComplete):
-            terminals.append(event.reason)
+        while True:
+            event = await handle.events.get()
+            if isinstance(event, ev.TurnComplete):
+                terminals.append(event.reason)
+                break
     await handle.commands.put(ev.Shutdown())
     await handle.task
     assert terminals == [StopReason.STOPPED, StopReason.STOPPED]

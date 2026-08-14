@@ -104,12 +104,12 @@ async def test_second_turn_appends_and_ids_stay_monotonic():
     )
     agent = Agent(provider=provider, persona="p")
     handle = agent.spawn()
+    # Sequential sends: a SendMessage during a running turn would STEER into it
+    # (commit 10) — this test needs two distinct turns.
     for text in ("q1", "q2"):
         await handle.commands.put(ev.SendMessage(text=text))
-    seen_terminals = 0
-    while seen_terminals < 2:
-        if isinstance(await handle.events.get(), ev.TurnComplete):
-            seen_terminals += 1
+        while not isinstance(await handle.events.get(), ev.TurnComplete):
+            pass
     await handle.commands.put(ev.Shutdown())
     await handle.task
     # second call saw the whole first turn: persona, q1, one, q2

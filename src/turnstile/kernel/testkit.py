@@ -275,6 +275,39 @@ class BlockUntilCancelTool(Tool):
         return ToolResult(call_id="", content="(cancelled cooperatively)", is_error=True)
 
 
+class CommandInjectorTool(Tool):
+    """Injects a pre-configured AgentCommand back into the session MID-TURN, the
+    first time it executes — a deterministic mid-turn injection point (the
+    kernel runs execute between the assistant's tool_call and the round ending).
+    `commands_slot` is a one-element list filled with handle.commands AFTER
+    spawn (the queue only exists then). Yields to the event loop after sending
+    so the session's mid-turn select drains the command while the turn is still
+    in flight."""
+
+    def __init__(self, commands_slot: list, command: object, yields: int = 16) -> None:
+        self._slot = commands_slot
+        self._command = command
+        self._yields = yields
+        self._fired = False
+
+    def name(self) -> str:
+        return "inject"
+
+    def description(self) -> str:
+        return "Injects an AgentCommand mid-turn (test only)"
+
+    def parameters_schema(self) -> dict:
+        return {"type": "object", "properties": {}}
+
+    async def execute(self, args: str, ctx: ToolContext) -> ToolResult:
+        if not self._fired and self._slot:
+            self._fired = True
+            self._slot[0].put_nowait(self._command)
+            for _ in range(self._yields):
+                await asyncio.sleep(0)
+        return ToolResult(call_id="", content="injected")
+
+
 class FailingTool(Tool):
     """Raises from execute — proves the loop converts exceptions into error
     ToolResults instead of unwinding the turn (the must-not-raise adaptation)."""
