@@ -16,10 +16,21 @@ packages = ["src/turnstile"]
 [dependency-groups]
 dev = [
     "import-linter>=2.13",
+    "pyright>=1.1.411",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "ruff>=0.16.2",
 ]
+
+# Whole-program type gate (same engine as Pylance, enforced in CI). Convention:
+# modules use `from __future__ import annotations`, so forward references need
+# no quoting. Tagged-union `match` arms prove exhaustiveness via assert_never.
+[tool.pyright]
+include = ["src", "tests"]
+pythonVersion = "3.12"
+typeCheckingMode = "standard"
+venvPath = "."
+venv = ".venv"
 
 # The dependency rule (docs/architecture.md §1) as a failing build.
 # TODO(M3): when `turnstile.root` / `turnstile.config` and a second product spec
