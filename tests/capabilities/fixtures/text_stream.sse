@@ -1,0 +1,12 @@
+data: {"id":"chatcmpl-bffe559ff4137452","object":"chat.completion.chunk","created":1787068923,"model":"model-fast","choices":[{"index":0,"delta":{"role":"assistant","content":""},"logprobs":null,"finish_reason":null}],"prompt_token_ids":null,"prompt_text":null}
+
+data: {"id":"chatcmpl-bffe559ff4137452","object":"chat.completion.chunk","created":1787068923,"model":"model-fast","choices":[{"index":0,"delta":{"content":"hello"},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-bffe559ff4137452","object":"chat.completion.chunk","created":1787068923,"model":"model-fast","choices":[{"index":0,"delta":{"content":" turnstile"},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-bffe559ff4137452","object":"chat.completion.chunk","created":1787068923,"model":"model-fast","choices":[{"index":0,"delta":{},"logprobs":null,"finish_reason":"stop","stop_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-bffe559ff4137452","object":"chat.completion.chunk","created":1787068923,"model":"model-fast","choices":[],"usage":{"prompt_tokens":18,"total_tokens":23,"completion_tokens":5},"system_fingerprint":"vllm-0.25.0-tp2-db85e561"}
+
+data: [DONE]
+
