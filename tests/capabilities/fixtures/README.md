@@ -25,3 +25,18 @@ NOT capturable from ds4 on demand, so covered by synthetic inline bodies in
 `test_openai_compat.py` instead of fixture files: malformed garbage lines
 (a gateway hiccup), `reasoning_content` (model-fast has no reasoning parser),
 and `prompt_tokens_details.cached_tokens` (this vLLM build doesn't report it).
+
+## kb_search fixtures
+
+Real bytes recorded 2026-08-18 from the internal GPU stack at
+`https://10.83.135.206` (qwen3-embedding-8b at
+`/api/v1/embedding/qwen3-embedding-8b`, Milvus proxy at
+`/api/v2/vectordb/hybrid_search_generic`), query
+`what is my leave benefits` over collection `agentassist_user_datasource`
+scoped `doc_id in ["hrus#e35025e3-58c2-4d6c-8e59-4f62277b3e6e"]` (the
+HR US SharePoint datasource).
+
+| fixture | provenance |
+|---|---|
+| `kb_embedding_response.json` | `[[vec]]` batch, recorded at `dim_size: 64` (server honors MRL truncation) so the fixture stays small; production uses 4096 |
+| `kb_search_response.json` | flat row list `[{content, ref, doc_id, score, weighted_score}]`, k=5 — extra keys kept verbatim, the tool must ignore them |
