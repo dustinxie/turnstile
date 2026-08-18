@@ -11,6 +11,7 @@ from turnstile.capabilities.providers.openai_compat import OpenAICompatProvider
 from turnstile.kernel.dtos import (
     ChatOptions,
     Done,
+    ErrorEvent,
     Malformed,
     Message,
     ProviderError,
@@ -214,3 +215,154 @@ async def test_non_200_raises_structured_provider_error():
         await _events(provider)
     assert excinfo.value.http_status == 401
     assert "Access Denied" in excinfo.value.message
+
+
+# ── error taxonomy (commit 2) ──────────────────────────────────────────
+
+
+async def test_5xx_is_retryable_with_parsed_openai_error_body():
+    provider, _ = _provider(
+        status=503, body='{"error": {"message": "upstream saturated", "code": "overloaded"}}'
+    )
+    with pytest.raises(ProviderError) as excinfo:
+        await _events(provider)
+    error = excinfo.value
+    assert error.retryable and error.http_status == 503
+    assert error.code == "overloaded" and "upstream saturated" in error.message
+
+
+async def test_4xx_is_terminal_and_vllm_flat_body_parses():
+    provider, _ = _provider(
+        status=400, body='{"object": "error", "message": "bad request", "code": 40004}'
+    )
+    with pytest.raises(ProviderError) as excinfo:
+        await _events(provider)
+    error = excinfo.value
+    assert not error.retryable and error.code == "40004"
+
+
+async def test_overflow_code_feeds_kernel_classifier():
+    provider, _ = _provider(
+        status=400,
+        body='{"error": {"message": "maximum context length exceeded", "code": "context_length_exceeded"}}',
+    )
+    with pytest.raises(ProviderError) as excinfo:
+        await _events(provider)
+    assert excinfo.value.is_context_overflow()  # the kernel's overflow recovery keys on this
+
+
+async def test_429_carries_retry_after_header():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429, content=b'{"error": {"message": "slow down"}}', headers={"Retry-After": "45"}
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = OpenAICompatProvider(base_url="https://x/v1", model="m", client=client)
+    with pytest.raises(ProviderError) as excinfo:
+        await _events(provider)
+    error = excinfo.value
+    assert error.http_status == 429 and error.retryable and error.retry_after_secs == 45
+
+
+async def test_transport_failure_at_open_is_retryable_provider_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = OpenAICompatProvider(base_url="https://x/v1", model="m", client=client)
+    with pytest.raises(ProviderError) as excinfo:
+        await _events(provider)
+    assert excinfo.value.retryable and "connection refused" in excinfo.value.message
+
+
+async def test_mid_stream_transport_death_becomes_error_event():
+    good_chunk = (
+        b'data: {"id":"c","model":"m","choices":[{"index":0,'
+        b'"delta":{"content":"partial"},"finish_reason":null}]}\n\n'
+    )
+
+    async def raising_body():
+        yield good_chunk
+        raise httpx.ReadError("connection reset")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, content=raising_body(), headers={"Content-Type": "text/event-stream"}
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = OpenAICompatProvider(base_url="https://x/v1", model="m", client=client)
+    events = await _events(provider)  # must NOT raise: the stream had opened
+    assert [e.text for e in events if isinstance(e, TextDelta)] == ["partial"]
+    errors = [e for e in events if isinstance(e, ErrorEvent)]
+    assert len(errors) == 1 and errors[0].error.retryable
+    assert not any(isinstance(e, Done) for e in events)  # failed, not finished
+
+
+# ── options mapping + affinity (commit 2) ──────────────────────────────
+
+
+async def test_chat_options_map_to_wire_and_sideband_stays_off():
+    provider, seen = _provider("text_stream.sse")
+    options = ChatOptions(
+        reasoning_effort="high",
+        max_tokens=512,
+        temperature=0.2,
+        tool_choice="required",
+        rate_limit_retry_owner="kernel",
+    )
+    async for _ in provider.chat_stream([Message.user("q")], [], options):
+        pass
+    payload = json.loads(seen[0].content)
+    assert payload["max_tokens"] == 512
+    assert payload["temperature"] == 0.2
+    assert payload["reasoning_effort"] == "high"
+    assert payload["tool_choice"] == "required"
+    assert "rate_limit_retry_owner" not in json.dumps(payload)  # sideband never on wire
+
+
+async def test_neutral_options_omit_everything_and_specific_tool_maps():
+    provider, seen = _provider("text_stream.sse")
+    async for _ in provider.chat_stream([Message.user("q")], [], ChatOptions()):
+        pass
+    payload = json.loads(seen[0].content)
+    for absent in ("max_tokens", "temperature", "reasoning_effort", "tool_choice"):
+        assert absent not in payload  # a neutral request carries no opinions
+
+    provider2, seen2 = _provider("text_stream.sse")
+    async for _ in provider2.chat_stream(
+        [Message.user("q")], [], ChatOptions(tool_choice="kb_search")
+    ):
+        pass
+    payload2 = json.loads(seen2[0].content)
+    assert payload2["tool_choice"] == {"type": "function", "function": {"name": "kb_search"}}
+
+
+async def test_bind_session_id_is_one_shot_affinity_header():
+    provider, seen = _provider("text_stream.sse")
+    async for _ in provider.chat_stream([Message.user("q")], [], ChatOptions()):
+        pass
+    assert "x-turnstile-session-id" not in seen[0].headers  # unbound: header omitted
+
+    provider.bind_session_id("session-42")
+    provider.bind_session_id("later-rebind-ignored")
+    async for _ in provider.chat_stream([Message.user("q")], [], ChatOptions()):
+        pass
+    assert seen[1].headers["x-turnstile-session-id"] == "session-42"
+
+
+async def test_enable_thinking_maps_to_the_vllm_chat_template_kwarg():
+    # a per-call knob like reasoning_effort: None = omitted, False/True = sent
+    # the vLLM/SGLang way (forwarded into the model's chat template)
+    provider, seen = _provider("text_stream.sse")
+    async for _ in provider.chat_stream([Message.user("q")], [], ChatOptions(max_tokens=200)):
+        pass
+    assert "chat_template_kwargs" not in json.loads(seen[0].content)
+    async for _ in provider.chat_stream(
+        [Message.user("q")], [], ChatOptions(max_tokens=200, enable_thinking=False)
+    ):
+        pass
+    payload = json.loads(seen[1].content)
+    assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+    assert payload["max_tokens"] == 200  # per-call options intact beside it
