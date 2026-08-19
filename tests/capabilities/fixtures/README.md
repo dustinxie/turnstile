@@ -40,3 +40,11 @@ HR US SharePoint datasource).
 |---|---|
 | `kb_embedding_response.json` | `[[vec]]` batch, recorded at `dim_size: 64` (server honors MRL truncation) so the fixture stays small; production uses 4096 |
 | `kb_search_response.json` | flat row list `[{content, ref, doc_id, score, weighted_score}]`, k=5 — extra keys kept verbatim, the tool must ignore them |
+
+## web_search fixture
+
+`exa_search_response.txt` — real bytes recorded 2026-08-18 from
+`https://mcp.exa.ai/mcp` (keyless tier): JSON-RPC `tools/call`
+`web_search_exa` with `{"query": "FortiGate 7.6 release notes",
+"numResults": 3}`; the response is one SSE `data:` line carrying
+`result.content[0].text` (LLM-ready Title/URL/Highlights blocks).
