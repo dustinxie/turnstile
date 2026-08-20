@@ -36,10 +36,9 @@ typeCheckingMode = "standard"
 venvPath = "."
 venv = ".venv"
 
-# The dependency rule (docs/architecture.md §1) as a failing build.
-# TODO(M3): when `turnstile.root` / `turnstile.config` and a second product spec
-# exist, add them to these contracts plus an "independence" contract over
-# turnstile.products.specs.* (the sibling-product ban).
+# The dependency rule (docs/architecture.md §1) as a failing build. `root` is
+# deliberately in NO forbidden list — composition is its job, that's its
+# documented exemption.
 # TODO(second driver): if a sibling driver lands (e.g. `turnstile.cli` next to
 # `turnstile.service`), add an "independence" contract over the drivers — they
 # consume root.assemble(), never each other.
@@ -59,25 +58,51 @@ forbidden_modules = [
     "turnstile.capabilities",
     "turnstile.products",
     "turnstile.service",
+    "turnstile.root",
+    "turnstile.config",
 ]
 
 [[tool.importlinter.contracts]]
 name = "L1 capabilities import kernel only"
 type = "forbidden"
 source_modules = ["turnstile.capabilities"]
-forbidden_modules = ["turnstile.products", "turnstile.service"]
+forbidden_modules = [
+    "turnstile.products",
+    "turnstile.service",
+    "turnstile.root",
+    # design doc §4: config never crosses into a capability — root converts
+    # at the boundary (plain kwargs / a mirror type).
+    "turnstile.config",
+]
 
 [[tool.importlinter.contracts]]
-name = "L2 products never import the service"
+name = "L2 products never import service/root/config"
 type = "forbidden"
 source_modules = ["turnstile.products"]
-forbidden_modules = ["turnstile.service"]
+forbidden_modules = [
+    "turnstile.service",
+    "turnstile.root",
+    # specs read cfg DUCK-TYPED (design doc §3) — naming the class here would
+    # make every product depend on the deployment's config layer.
+    "turnstile.config",
+]
 
 [[tool.importlinter.contracts]]
-name = "Service is driver-generic: no products/capabilities imports"
+name = "Service is driver-generic: root + kernel only"
 type = "forbidden"
 source_modules = ["turnstile.service"]
-forbidden_modules = ["turnstile.products", "turnstile.capabilities"]
+forbidden_modules = [
+    "turnstile.products",
+    "turnstile.capabilities",
+    # the driver reads deployment config through root.assemble()'s bundle,
+    # never directly.
+    "turnstile.config",
+]
+
+[[tool.importlinter.contracts]]
+name = "Product specs are siblings: no spec imports another"
+type = "independence"
+modules = ["turnstile.products.specs.*"]
 
 [tool.ruff]
 target-version = "py312"
