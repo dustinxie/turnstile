@@ -45,6 +45,13 @@ class AssembledAgent:
     judge: QualityJudgeHook | None = None
 
 
+def load_config() -> Config:
+    """Read the deployment config from the environment (+ optional .env).
+    Lives here so DRIVERS never import the config layer (the c6 contract):
+    a driver calls root.load_config() and holds the result opaquely."""
+    return Config()  # type: ignore[call-arg] — fields come from the env
+
+
 def build_store() -> MemorySessionStore:
     """The snapshot store outlives any one conversation, so a driver builds
     it once and passes it into every assemble() (M4's registry does this)."""

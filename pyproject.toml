@@ -5,6 +5,7 @@ description = "Chatbot service on a one-loop, two-layer agent kernel (L0/L1/L2)"
 readme = "README.md"
 requires-python = "==3.12.*"
 dependencies = [
+    "fastapi>=0.141.1",
     "httpx>=0.28.1",
     "mcp>=2.0.0",
     "pydantic-settings>=2.15.0",
@@ -98,6 +99,9 @@ forbidden_modules = [
     # never directly.
     "turnstile.config",
 ]
+# DIRECT imports only: service -> root -> products is the intended path (the
+# bundle); the ban is on the service NAMING product/capability/config types.
+allow_indirect_imports = "true"
 
 [[tool.importlinter.contracts]]
 name = "Product specs are siblings: no spec imports another"
