@@ -10,11 +10,13 @@ not an entry point (architecture.md §2).
 Tests inject their own `cfg` so no environment is needed.
 """
 
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI
 
 from turnstile import root
+from turnstile.service.registry import ConversationRegistry
 
 
 def create_app(cfg: Any = None) -> FastAPI:
@@ -23,12 +25,20 @@ def create_app(cfg: Any = None) -> FastAPI:
     if cfg is None:
         cfg = root.load_config()
 
-    app = FastAPI(title="turnstile", docs_url=None, redoc_url=None)
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        yield
+        # Graceful drain: every running session gets Shutdown (bounded), so
+        # in-flight turns finish their snapshots before the process exits.
+        await app.state.registry.shutdown_all()
+
+    app = FastAPI(title="turnstile", docs_url=None, redoc_url=None, lifespan=lifespan)
     # Process-wide state: ONE snapshot store outlives every conversation
-    # (root.build_store's contract); cfg is what assemble() will consume
-    # per conversation (M4-c2's registry).
+    # (root.build_store's contract); the registry maps conversation ids onto
+    # running agents assembled from cfg + that store.
     app.state.cfg = cfg
     app.state.store = root.build_store()
+    app.state.registry = ConversationRegistry(cfg, app.state.store)
 
     @app.get("/health")
     async def health() -> dict:
