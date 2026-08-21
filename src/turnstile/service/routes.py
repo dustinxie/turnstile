@@ -12,6 +12,7 @@ A POST while this conversation's turn is still streaming STEERS it
 events queue is single-consumer, so there is never a second pump.
 """
 
+import asyncio
 import json
 import re
 from dataclasses import asdict, is_dataclass
@@ -69,8 +70,78 @@ async def post_message(conversation_id: str, body: MessageIn, request: Request):
                 event = await entry.handle.events.get()
                 yield {"event": event_name(event), "data": event_data(event)}
                 if isinstance(event, ev.TurnComplete):
-                    break
-        finally:
-            entry.in_flight = False
+                    entry.in_flight = False  # clean end: the slot frees here
+                    return
+        except (asyncio.CancelledError, GeneratorExit):
+            # DISCONNECT != CANCEL (architecture §2): the client vanished but
+            # the turn keeps running detached — cancelling here would erase the
+            # user's message on every flaky network. A drainer adopts the event
+            # stream so the queue never carries stale events into the next
+            # pump, and in_flight stays True (a POST meanwhile still steers).
+            _adopt_detached(entry)
+            raise
 
     return EventSourceResponse(stream())
+
+
+# Strong refs to detached drainers (a bare create_task is GC-bait).
+_DETACHED: set[asyncio.Task] = set()
+
+
+def _adopt_detached(entry) -> None:
+    task = asyncio.create_task(_drain_detached(entry))
+    _DETACHED.add(task)
+    task.add_done_callback(_DETACHED.discard)
+
+
+async def _drain_detached(entry) -> None:
+    """Consume the abandoned turn's events until it completes (they are not
+    lost — the snapshot hook persists the turn; a reconnecting client
+    refetches via GET). Also exits if the session task dies (eviction), so a
+    drainer can never leak."""
+    while True:
+        getter = asyncio.ensure_future(entry.handle.events.get())
+        done, _ = await asyncio.wait(
+            {getter, entry.handle.task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if getter in done:
+            if isinstance(getter.result(), ev.TurnComplete):
+                entry.in_flight = False
+                return
+        else:
+            getter.cancel()  # session gone (evicted/shutdown): nothing to drain
+            entry.in_flight = False
+            return
+
+
+@router.post("/conversations/{conversation_id}/cancel")
+async def cancel_turn(conversation_id: str, request: Request):
+    """EXPLICIT cancel — the only way a turn is ever cancelled (a dropped
+    connection never is). The kernel checkpoints the cancel and, with
+    keep_interrupted_context, preserves the partial work."""
+    entry = request.app.state.registry.get(conversation_id)
+    if entry is None or not entry.in_flight:
+        return JSONResponse({"status": "idle"})  # nothing running; not an error
+    await entry.handle.commands.put(ev.Cancel())
+    return JSONResponse({"status": "cancelling"}, status_code=202)
+
+
+@router.get("/conversations/{conversation_id}")
+async def get_conversation(conversation_id: str, request: Request):
+    """The refetch surface: the persisted conversation, straight from the
+    snapshot store. This is what a client reads after a reconnect — it never
+    spawns an agent and never touches a running turn."""
+    snapshot = request.app.state.store.load(conversation_id)
+    if snapshot is None:
+        return JSONResponse({"detail": "unknown conversation"}, status_code=404)
+    entry = request.app.state.registry.get(conversation_id)
+    return {
+        "conversation_id": conversation_id,
+        "turn_counter": snapshot.turn_counter,
+        "in_flight": bool(entry and entry.in_flight),
+        "messages": [
+            {"role": m.role.value, "text": m.text}
+            for m in snapshot.messages
+            if m.text and not m.synthetic
+        ],
+    }

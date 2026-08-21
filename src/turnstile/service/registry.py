@@ -72,6 +72,11 @@ class ConversationRegistry:
         entry.last_used = self._now()
         return entry
 
+    def get(self, conversation_id: str) -> _Entry | None:
+        """Peek without spawning — for endpoints that act only on a LIVE
+        conversation (cancel) and must not create one as a side effect."""
+        return self._entries.get(conversation_id)
+
     def active_ids(self) -> list[str]:
         return list(self._entries)
 
