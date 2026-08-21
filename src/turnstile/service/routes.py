@@ -3,7 +3,7 @@
 The SSE stream IS the driver protocol serialized verbatim (architecture.md
 §2): one SSE event per AgentEvent — `event:` carries the snake_cased event
 class, `data:` its fields as JSON — ending with the terminal turn_complete.
-(The service-added envelope event lands in M4-c5; buffer-until-judged rides
+(The service-added envelope event lands in M4-c5; withhold-until-turn-complete rides
 with it.)
 
 A POST while this conversation's turn is still streaming STEERS it
@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
 from turnstile.kernel import events as ev
+from turnstile.service.envelope import build_envelope
 
 router = APIRouter()
 
@@ -62,14 +63,33 @@ async def post_message(conversation_id: str, body: MessageIn, request: Request):
         return JSONResponse({"status": "steered"}, status_code=202)
 
     entry.in_flight = True
+    # withhold-until-turn-complete (architecture §2): a judge can retry the
+    # answer mid-turn, so streamed text is provisional — text deltas are
+    # withheld until TurnComplete, whose envelope carries the accepted
+    # answer. Without a judge, text streams live. All non-text events
+    # stream either way.
+    withhold_text = entry.bundle.judge is not None
 
     async def stream():
         try:
             await entry.handle.commands.put(ev.SendMessage(text=body.text))
             while True:
                 event = await entry.handle.events.get()
+                if withhold_text and isinstance(event, ev.TextDelta):
+                    continue
                 yield {"event": event_name(event), "data": event_data(event)}
                 if isinstance(event, ev.TurnComplete):
+                    # hooks ran before the event (engine contract), so the
+                    # snapshot already holds this turn — the envelope reads
+                    # the ACCEPTED answer from it, never a concat of drafts.
+                    envelope = build_envelope(
+                        conversation_id,
+                        entry.bundle.store.load(conversation_id),
+                        stop_reason=event.reason.value,
+                        judge=entry.bundle.judge,
+                        references=entry.bundle.references.take(),
+                    )
+                    yield {"event": "envelope", "data": json.dumps(envelope)}
                     entry.in_flight = False  # clean end: the slot frees here
                     return
         except (asyncio.CancelledError, GeneratorExit):
@@ -106,6 +126,7 @@ async def _drain_detached(entry) -> None:
         )
         if getter in done:
             if isinstance(getter.result(), ev.TurnComplete):
+                entry.bundle.references.take()  # discard: refs are per-turn
                 entry.in_flight = False
                 return
         else:

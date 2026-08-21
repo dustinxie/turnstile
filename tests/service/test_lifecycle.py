@@ -119,7 +119,8 @@ async def test_cancel_endpoint_cancels_the_running_turn():
         events = await turn  # the open stream carries the cancel terminally
     names = [n for n, _ in events]
     assert "cancelled" in names
-    assert events[-1] == ("turn_complete", {"reason": "cancelled"})
+    assert ("turn_complete", {"reason": "cancelled"}) in events
+    assert events[-1][0] == "envelope" and events[-1][1]["signal"] == "no_answer"
     # keep_interrupted_context: the user's message survived into the snapshot
     snapshot = app.state.store.load("c1")
     assert snapshot is not None

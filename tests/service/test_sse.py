@@ -94,10 +94,11 @@ async def test_turn_streams_as_verbatim_sse_events():
         events = await _sse_events(response)
 
     names = [n for n, _ in events]
-    assert names[-1] == "turn_complete"  # terminal, stream closed after it
+    # kernel-terminal turn_complete, then the service-added envelope (M4-c5)
+    assert names[-2:] == ["turn_complete", "envelope"]
     deltas = [d["text"] for n, d in events if n == "text_delta"]
     assert deltas == ["hel", "lo"]
-    assert events[-1][1]["reason"] == "stopped"
+    assert events[-2][1]["reason"] == "stopped"
 
 
 async def test_tool_rounds_ride_the_same_stream():
