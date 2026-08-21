@@ -35,6 +35,10 @@ class _Entry:
     bundle: AssembledAgent
     handle: AgentHandle
     last_used: float = field(default=0.0)
+    # True while a route is pumping this conversation's event stream. A POST
+    # arriving then steers the running turn instead of opening a second pump —
+    # the events queue is single-consumer.
+    in_flight: bool = False
 
 
 class ConversationRegistry:

@@ -16,6 +16,7 @@ from typing import Any
 from fastapi import FastAPI
 
 from turnstile import root
+from turnstile.service import routes
 from turnstile.service.registry import ConversationRegistry
 
 
@@ -39,6 +40,10 @@ def create_app(cfg: Any = None) -> FastAPI:
     app.state.cfg = cfg
     app.state.store = root.build_store()
     app.state.registry = ConversationRegistry(cfg, app.state.store)
+    # API is versioned (/v1/conversations/...); /health is deliberately
+    # OUTSIDE the prefix — probes pin to the container, not the API contract,
+    # and must not move when the API version bumps.
+    app.include_router(routes.router, prefix="/v1")
 
     @app.get("/health")
     async def health() -> dict:

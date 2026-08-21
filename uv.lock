@@ -684,6 +684,7 @@ dependencies = [
     { name = "httpx" },
     { name = "mcp" },
     { name = "pydantic-settings" },
+    { name = "sse-starlette" },
 ]
 
 [package.dev-dependencies]
@@ -701,6 +702,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "mcp", specifier = ">=2.0.0" },
     { name = "pydantic-settings", specifier = ">=2.15.0" },
+    { name = "sse-starlette", specifier = ">=3.4.8" },
 ]
 
 [package.metadata.requires-dev]
