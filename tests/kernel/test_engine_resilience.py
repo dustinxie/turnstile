@@ -2,6 +2,8 @@
 the 429 path, stream timeouts, empty-200 retries, truncation continuation,
 partial-stream persistence. All backoffs run with backoff_scale=0."""
 
+import asyncio
+
 import pytest
 
 from turnstile.kernel import events as ev
@@ -214,6 +216,53 @@ async def test_idle_timeout_reconnects_then_succeeds():
     assert events[-1].reason is StopReason.STOPPED
     assert provider.call_count == 2
     assert any(isinstance(e, ev.Warning) and "reconnecting" in e.message for e in events)
+
+
+class _PacedProvider:
+    """Duck-typed LlmProvider with controlled delays: `first_delay` before the
+    first event, `gap` before the second — the TTFT vs inter-token split."""
+
+    def __init__(self, first_delay: float = 0.0, gap: float = 0.0) -> None:
+        self.first_delay, self.gap = first_delay, gap
+        self.call_count = 0
+
+    def model_name(self) -> str:
+        return "paced"
+
+    def context_window(self) -> int:
+        return 0
+
+    def bind_session_id(self, session_id: str) -> None:
+        pass
+
+    async def chat_stream(self, messages, tools, options):
+        self.call_count += 1
+        await asyncio.sleep(self.first_delay)
+        yield TextDelta("first")
+        await asyncio.sleep(self.gap)
+        yield TextDelta(" second")
+        yield Done()
+
+
+async def test_first_event_gets_the_prefill_allowance():
+    # TTFT = 3x stream_timeout: over the inter-token bound, well inside the
+    # FIRST_EVENT_TIMEOUT_FACTOR budget — no reconnect, no timeout.
+    provider = _PacedProvider(first_delay=0.3)
+    events = await _collect(_agent(provider, stream_timeout=0.1))
+    assert events[-1].reason is StopReason.STOPPED
+    assert provider.call_count == 1  # the allowance absorbed the prefill wait
+    assert not any(isinstance(e, ev.Warning) for e in events)
+
+
+async def test_mid_stream_gap_keeps_the_tight_bound():
+    # The SAME 0.3s gap that the first event tolerates is a liveness failure
+    # mid-stream: content already arrived, so the partial is preserved.
+    provider = _PacedProvider(gap=0.3)
+    events = await _collect(_agent(provider, stream_timeout=0.1))
+    assert events[-1].reason is StopReason.TIMEOUT
+    assert any(
+        isinstance(e, ev.Error) and "partial response preserved" in e.message for e in events
+    )
 
 
 async def test_idle_timeout_budget_exhaustion_times_out():

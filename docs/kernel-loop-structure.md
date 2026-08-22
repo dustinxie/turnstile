@@ -434,7 +434,7 @@ The provider adapter's own fast transport retries sit BELOW all of these.
 | retryable open error (5xx/transport) | visible warning + cancellable backoff (3/6/9s), re-issue same round | 3 / round |
 | 429 rate limit | `on_rate_limit` hook verdict, else hint fallback: `WaitAndRetry{secs}` (cancellable sleep, re-issue) or `Pause` (clean `RATE_LIMITED` stop, content preserved). First anonymous 429 retries quietly (1s, no banner) | 5 waits / turn (livelock fuse) |
 | context overflow at open | compact (`Overflow` trigger, escalating) + retry round | 3 / round |
-| stream idle timeout | reconnect same round with exponential backoff — only while NO content has arrived; after content: persist the partial, `TIMEOUT` | 5 / round |
+| stream idle timeout | reconnect same round with exponential backoff — only while NO content has arrived; after content: persist the partial, `TIMEOUT`. The FIRST event of each attempt gets `stream_timeout × FIRST_EVENT_TIMEOUT_FACTOR` (20): TTFT covers prefill, which scales with context; inter-token gaps are decode-bound and keep the tight bound. | 5 / round |
 | empty 200 (no content at all) | short backoff + re-issue; keyed on PROVIDER content, not post-hook text (a redacting hook ≠ an empty response) | 5 / turn; exhaustion → `PROVIDER_ERROR` with size-aware message |
 | output truncated (`length`), no tool calls | synthetic resume nudge steering toward incremental file writes | 2 / turn |
 

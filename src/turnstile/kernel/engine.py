@@ -75,6 +75,14 @@ from turnstile.kernel.ports import (
 
 # Failed-open transient retries per round (the adapter's own fast transport
 # retries sit BELOW this tier). Visible waits: 3/6/9s.
+# First-event allowance on the liveness timeout: waiting for the FIRST stream
+# event covers prefill, which is compute-bound and scales with context length;
+# inter-token gaps are decode-bound and near-constant. One knob, two budgets:
+# stream_timeout x THIS for time-to-first-token, stream_timeout plain between
+# events — e.g. stream_timeout=5 gives a tight 5s inter-token bound with a
+# 100s TTFT budget that survives a long prefill on a loaded box.
+FIRST_EVENT_TIMEOUT_FACTOR = 20
+
 MAX_PROVIDER_RETRIES = 3
 # Mid-stream idle-timeout reconnects per round — only while NO content arrived
 # (replaying after content risks duplicate output/side effects).
@@ -263,6 +271,11 @@ class Agent:
     session_id: str | None = None
     resume: SessionSnapshot | None = None
     working_dir: str = "."
+    # KERNEL<->DRIVER round-trip bound, nothing to do with HTTP: how long a
+    # Request (approval ask, round-cap checkpoint) awaits the driver's Respond
+    # before degrading to None — the asker proceeds FAIL-CLOSED (approval sees
+    # None -> deny). None (default) = wait forever; bound it whenever no human
+    # is guaranteed to be attached to the driver.
     request_timeout: float | None = None
     # Cancel semantics: False (default) = CANCEL IS UNDO — the cancelled turn
     # rolls back to before its user message, leaving no trace. True = preserve
@@ -968,9 +981,12 @@ class _Session:
                 # Race the next event against cancel and the liveness timeout —
                 # every await inside the stream is bounded and cancellable.
                 next_event = asyncio.ensure_future(anext(iterator))
+                timeout = self._a.stream_timeout
+                if timeout is not None and not opened:
+                    timeout *= FIRST_EVENT_TIMEOUT_FACTOR  # prefill allowance
                 done, _ = await asyncio.wait(
                     {next_event, cancel_wait},
-                    timeout=self._a.stream_timeout,
+                    timeout=timeout,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if cancel_wait in done:
