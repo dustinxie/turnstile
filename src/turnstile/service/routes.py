@@ -18,12 +18,13 @@ import re
 from dataclasses import asdict, is_dataclass
 from enum import Enum
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
 from turnstile.kernel import events as ev
+from turnstile.service.auth import require_user
 from turnstile.service.envelope import build_envelope
 
 router = APIRouter()
@@ -51,10 +52,28 @@ def event_data(event: object) -> str:
     )
 
 
+def _guard_owner(request: Request, conversation_id: str, principal: str) -> None:
+    """404 on someone else's conversation — never 403, which would leak that
+    the id exists. Unclaimed ids pass (the caller may become the owner)."""
+    owner = request.app.state.store.owner(conversation_id)
+    if owner is not None and owner != principal:
+        raise HTTPException(status_code=404, detail="unknown conversation")
+
+
 @router.post("/conversations/{conversation_id}/messages")
-async def post_message(conversation_id: str, body: MessageIn, request: Request):
+async def post_message(
+    conversation_id: str,
+    body: MessageIn,
+    request: Request,
+    principal: str = Depends(require_user),
+):
+    _guard_owner(request, conversation_id, principal)
     registry = request.app.state.registry
     await registry.evict_idle()  # opportunistic sweep — no background task needed
+    # First toucher claims the conversation; the guard above already 404'd
+    # a non-owner, so a mismatch here can only be a concurrent first claim.
+    if request.app.state.store.claim(conversation_id, principal) != principal:
+        raise HTTPException(status_code=404, detail="unknown conversation")
     entry = registry.get_or_create(conversation_id)
 
     if entry.in_flight:
@@ -136,10 +155,13 @@ async def _drain_detached(entry) -> None:
 
 
 @router.post("/conversations/{conversation_id}/cancel")
-async def cancel_turn(conversation_id: str, request: Request):
+async def cancel_turn(
+    conversation_id: str, request: Request, principal: str = Depends(require_user)
+):
     """EXPLICIT cancel — the only way a turn is ever cancelled (a dropped
     connection never is). The kernel checkpoints the cancel and, with
     keep_interrupted_context, preserves the partial work."""
+    _guard_owner(request, conversation_id, principal)
     entry = request.app.state.registry.get(conversation_id)
     if entry is None or not entry.in_flight:
         return JSONResponse({"status": "idle"})  # nothing running; not an error
@@ -148,10 +170,13 @@ async def cancel_turn(conversation_id: str, request: Request):
 
 
 @router.get("/conversations/{conversation_id}")
-async def get_conversation(conversation_id: str, request: Request):
+async def get_conversation(
+    conversation_id: str, request: Request, principal: str = Depends(require_user)
+):
     """The refetch surface: the persisted conversation, straight from the
     snapshot store. This is what a client reads after a reconnect — it never
     spawns an agent and never touches a running turn."""
+    _guard_owner(request, conversation_id, principal)
     snapshot = request.app.state.store.load(conversation_id)
     if snapshot is None:
         return JSONResponse({"detail": "unknown conversation"}, status_code=404)

@@ -88,6 +88,12 @@ class Config(BaseSettings):
     # context. A wedged connection becomes an idle-timeout reconnect (budget
     # 5) instead of a minutes-long stall. None = unbounded.
     stream_timeout: float | None = 5.0
+    # AuthN switch: the HS256 secret our JWTs are signed with (use >=32 random
+    # bytes; pyjwt warns below that). Unset = auth OFF (dev mode: every request
+    # is the "anonymous" principal). Tokens come from auth.mint_token — by hand
+    # today (see its docstring), from a future SAML/FAC login route later (the
+    # IdP authenticates; THIS service issues its own credential).
+    jwt_secret: str | None = None
 
     # Backends are siblings. The chat backend is required; the judge's is
     # optional and stands alone — grading an answer and producing it are

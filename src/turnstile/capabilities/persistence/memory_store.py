@@ -26,9 +26,22 @@ class MemorySessionStore:
 
     def __init__(self) -> None:
         self._latest: dict[str, SessionSnapshot] = {}
+        # Conversation ownership rides the session store because it has
+        # exactly the snapshot's lifetime: it must survive registry eviction
+        # (the resumed conversation is still the same principal's) and die
+        # with the session. M7's Redis store carries it the same way.
+        self._owners: dict[str, str] = {}
 
     def save(self, session_id: str, snapshot: SessionSnapshot) -> None:
         self._latest[session_id] = snapshot
+
+    def claim(self, session_id: str, owner: str) -> str:
+        """First claimant wins; returns the session's owner AFTER the call —
+        callers compare it to their principal (mismatch = not yours)."""
+        return self._owners.setdefault(session_id, owner)
+
+    def owner(self, session_id: str) -> str | None:
+        return self._owners.get(session_id)
 
     def load(self, session_id: str) -> SessionSnapshot | None:
         """The resume path: the latest snapshot, or None for a new/expired
@@ -38,6 +51,7 @@ class MemorySessionStore:
     def drop(self, session_id: str) -> None:
         """Forget a session (idle eviction). Missing id is a no-op."""
         self._latest.pop(session_id, None)
+        self._owners.pop(session_id, None)
 
     def checkpoint(self, session_id: str) -> CompactionCheckpoint:
         """A session-bound CompactionCheckpoint to pass as Agent.checkpoint."""
