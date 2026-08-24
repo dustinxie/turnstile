@@ -11,6 +11,7 @@ dependencies = [
     "pydantic-settings>=2.15.0",
     "pyjwt>=2.13.0",
     "sse-starlette>=3.4.8",
+    "uvicorn>=0.52.3",
 ]
 
 [build-system]

@@ -1,0 +1,10 @@
+# Build context hygiene: COPY in the Dockerfile is already explicit
+# (pyproject/lock/README/src); this keeps secrets and bulk out of the context.
+.env
+.env.*
+.git
+.venv
+__pycache__
+*.pyc
+tests
+docs

@@ -686,6 +686,7 @@ dependencies = [
     { name = "pydantic-settings" },
     { name = "pyjwt" },
     { name = "sse-starlette" },
+    { name = "uvicorn" },
 ]
 
 [package.dev-dependencies]
@@ -705,6 +706,7 @@ requires-dist = [
     { name = "pydantic-settings", specifier = ">=2.15.0" },
     { name = "pyjwt", specifier = ">=2.13.0" },
     { name = "sse-starlette", specifier = ">=3.4.8" },
+    { name = "uvicorn", specifier = ">=0.52.3" },
 ]
 
 [package.metadata.requires-dev]

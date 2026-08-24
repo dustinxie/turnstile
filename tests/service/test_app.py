@@ -32,7 +32,13 @@ async def test_health_reports_ok_and_the_served_spec():
     async with _client(app) as client:
         response = await client.get("/health")
     assert response.status_code == 200
-    assert response.json() == {"status": "ok", "spec": "support_bot"}
+    # provenance is "unknown" outside a stamped image (build-arg envs unset)
+    assert response.json() == {
+        "status": "ok",
+        "spec": "support_bot",
+        "commit": "unknown",
+        "docker_tag": "unknown",
+    }
 
 
 async def test_injected_cfg_is_used_verbatim():

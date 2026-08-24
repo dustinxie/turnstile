@@ -10,6 +10,7 @@ not an entry point (architecture.md §2).
 Tests inject their own `cfg` so no environment is needed.
 """
 
+import os
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -49,6 +50,14 @@ def create_app(cfg: Any = None) -> FastAPI:
     async def health() -> dict:
         # Liveness + which product this deployment serves. Deliberately no
         # upstream probes: a slow LLM must not flap the container's health.
-        return {"status": "ok", "spec": cfg.spec_id}
+        # `commit`/`docker_tag` are build provenance stamped into the image
+        # env by the Dockerfile (GIT_COMMIT/DOCKER_TAG build args) — "what is
+        # deployed?" answerable over HTTP.
+        return {
+            "status": "ok",
+            "spec": cfg.spec_id,
+            "commit": os.environ.get("GIT_COMMIT", "unknown"),
+            "docker_tag": os.environ.get("DOCKER_TAG", "unknown"),
+        }
 
     return app
