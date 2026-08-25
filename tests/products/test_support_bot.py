@@ -68,6 +68,8 @@ def test_persona_pins_kb_first_and_no_invention():
     persona = SupportBotSpec().persona(CFG)
     assert "kb_search first" in persona
     assert "never invent" in persona
+    # scope gate: off-topic questions get the fixed statement, no search
+    assert "HR & benefits questions only" in persona and "do\nnot search" in persona
     # citations: echo the server-assigned [n], never a hand-written source list
     assert "bracketed number" in persona and "Do not write your own list of sources" in persona
 
@@ -96,7 +98,7 @@ async def test_kb_first_journey_tool_round_then_answer():
     assert "PTO accrues" in outcome.text
     # the wire carried the spec's composition: persona + both tool defs + knobs
     call = provider.calls[0]
-    assert call.messages[0].text.startswith("You are an internal support assistant.")
+    assert call.messages[0].text.startswith("You are an internal HR & benefits assistant")
     assert [t.name for t in call.tools] == ["kb_search", "web_search"]
     assert call.options.temperature == 0.0
 

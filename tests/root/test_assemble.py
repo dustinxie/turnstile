@@ -69,7 +69,7 @@ def test_bundle_carries_the_agent_and_its_collectors():
     assert isinstance(bundle.agent.provider, OpenAICompatProvider)
     assert bundle.agent.provider.model_name() == "model-fast"
     assert bundle.agent.provider.context_window() == 128_000
-    assert bundle.agent.persona.startswith("You are an internal support assistant.")
+    assert bundle.agent.persona.startswith("You are an internal HR & benefits assistant")
     assert bundle.agent.chat_options.temperature == 0.0  # the spec's knob
     assert bundle.agent.keep_interrupted_context is True  # chatbot cancel semantics
     assert bundle.agent.stream_timeout == 5.0  # liveness: silent streams reconnect
