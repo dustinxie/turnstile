@@ -82,10 +82,14 @@ def resolve_file_token(secret: str | None, token: str) -> dict | None:
     return claim
 
 
-def _safe_segment(segment: str) -> bool:
-    """One path segment, nothing more. The token is authenticated so a bad
-    segment can only come from our own minting — defense in depth anyway."""
-    return bool(segment) and "/" not in segment and "\\" not in segment and segment != ".."
+def _safe_relative(rel: str) -> bool:
+    """A relative path that stays put: no absolute, no parent hops, no
+    backslash tricks. The region is one segment; the document path may nest
+    (kb refs are paths like "Benefits/2026/FAQ.pdf"). The token is
+    authenticated so a bad value can only come from our own minting —
+    defense in depth anyway, ahead of the resolved-containment check."""
+    parts = rel.split("/")
+    return bool(rel) and not rel.startswith("/") and "\\" not in rel and ".." not in parts
 
 
 @router.get("/files/{token}")
@@ -99,7 +103,7 @@ async def get_file(token: str, request: Request, principal: str = Depends(requir
         raise HTTPException(status_code=404, detail="not found")
 
     region, filename = str(claim.get("r", "")), str(claim.get("f", ""))
-    if not (_safe_segment(region) and _safe_segment(filename)):
+    if "/" in region or not (_safe_relative(region) and _safe_relative(filename)):
         raise HTTPException(status_code=404, detail="not found")
     root = Path(cfg.file_root).resolve()
     path = (root / region / filename).resolve()

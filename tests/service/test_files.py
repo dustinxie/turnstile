@@ -24,6 +24,9 @@ def store(tmp_path):
     (tmp_path / "hrus" / "leave_benefits.pdf").write_bytes(b"%PDF-1.7 us-version")
     (tmp_path / "hrcanada" / "leave_benefits.pdf").write_bytes(b"%PDF-1.7 ca-version")
     (tmp_path / "hrus" / "holidays.txt").write_text("fixed holidays")
+    # kb refs are paths, not bare filenames — the store nests accordingly
+    (tmp_path / "hrus" / "Benefits" / "2026 Benefits").mkdir(parents=True)
+    (tmp_path / "hrus" / "Benefits" / "2026 Benefits" / "OE FAQ.pdf").write_bytes(b"%PDF nested")
     return tmp_path
 
 
@@ -69,6 +72,15 @@ async def test_minted_link_serves_the_file_inline(store):
     assert response.headers["content-disposition"].startswith("inline")  # read, not download
 
 
+async def test_nested_document_paths_resolve_inside_the_region(store):
+    app = create_app(_cfg(store))
+    async with _client(app) as client:
+        url = _url("hrus", "Benefits/2026 Benefits/OE FAQ.pdf", "alice")
+        response = await client.get(url, headers=_bearer("alice"))
+    assert response.status_code == 200
+    assert response.content == b"%PDF nested"
+
+
 async def test_region_tier_disambiguates_same_name_docs(store):
     app = create_app(_cfg(store))
     async with _client(app) as client:
@@ -108,7 +120,13 @@ async def test_traversal_segments_never_resolve(store):
     app = create_app(_cfg(store))
     async with _client(app) as client:
         headers = _bearer("alice")
-        for region, filename in [("..", "outside.txt"), ("hrus", "../hrus/holidays.txt")]:
+        cases = [
+            ("..", "outside.txt"),
+            ("hrus", "../hrus/holidays.txt"),
+            ("hrus", "/etc/passwd"),
+            ("hrus/..", "outside.txt"),  # region must be ONE segment
+        ]
+        for region, filename in cases:
             url = _url(region, filename, "alice")
             assert (await client.get(url, headers=headers)).status_code == 404, (region, filename)
 

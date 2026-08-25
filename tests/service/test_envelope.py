@@ -173,7 +173,7 @@ async def test_unjudged_turn_streams_live_and_closes_with_the_envelope():
     assert envelope["answer"] == "the answer"
     assert envelope["signal"] == "unjudged" and envelope["score"] is None
     assert envelope["references"] == [
-        {"tool": "kb_search", "ref": "Handbook.pdf#L755", "url": None}
+        {"tool": "kb_search", "ref": "Handbook.pdf", "url": None}  # path; anchor is separate
     ]
     await app.state.registry.shutdown_all()
 

@@ -159,11 +159,20 @@ class KbSearchTool(Tool):
     @staticmethod
     def _render(rows: list[dict]) -> str:
         """Numbered excerpts the model can cite: `ref` is the source pointer
-        ("<filename>#L<line>"), score kept for relative relevance."""
+        ("<path>#L<line>"), prefixed with the doc's region ("hrus::") when
+        doc_id carries one ("<region>#<uuid>") — the region tier of the file
+        store; the "::" separator is unambiguous against path slashes. Score
+        kept for relative relevance. Numbers are per-call here; the
+        reference collector renumbers them turn-globally before the model
+        sees them."""
         parts: list[str] = []
         for n, row in enumerate(rows, start=1):
             ref = row.get("ref") or row.get("doc_id") or "unknown source"
+            doc_id = str(row.get("doc_id") or "")
+            region = doc_id.split("#", 1)[0] if "#" in doc_id else ""
             score = row.get("score")
-            header = f"[{n}] {ref}" + (f" (score {score:.3f})" if score is not None else "")
+            header = f"[{n}] " + (f"{region}::" if region else "") + ref
+            if score is not None:
+                header += f" (score {score:.3f})"
             parts.append(f"{header}\n{row.get('content', '')}")
         return "\n\n".join(parts)

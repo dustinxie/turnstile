@@ -129,7 +129,7 @@ async def test_recorded_responses_replay_end_to_end():
     assert len(payload["query_embedding"]) == 64  # fixture recorded at dim_size=64
     # real rows carry an extra `weighted_score` key — rendering must not care
     assert result.content.startswith(
-        "[1] Benefits/Health Resources/2026 Benefits/"
+        "[1] hrus::Benefits/Health Resources/2026 Benefits/"
         "FTNT 2026 OE Webinar FAQ Final v2.pdf#L521 (score 0.033)"
     )
     assert "paternity leave policy" in result.content
@@ -143,15 +143,15 @@ async def test_hits_render_as_numbered_cited_excerpts():
     tool, _ = _tool()
     result = await tool.execute(_args(), ToolContext("/tmp"))
     assert not result.is_error
-    assert "[1] pto.md#L12 (score 0.910)" in result.content
+    assert "[1] hrus::pto.md#L12 (score 0.910)" in result.content
     assert "PTO accrues at 1.5 days/month." in result.content
-    assert "[2] pto.md#L40" in result.content
+    assert "[2] hrus::pto.md#L40" in result.content
 
 
 async def test_envelope_response_shape_is_unwrapped():
     tool, _ = _tool(search_response={"results": ROWS})
     result = await tool.execute(_args(), ToolContext("/tmp"))
-    assert not result.is_error and "[2] pto.md#L40" in result.content
+    assert not result.is_error and "[2] hrus::pto.md#L40" in result.content
 
 
 async def test_no_hits_is_a_plain_answer_not_an_error():

@@ -1,12 +1,16 @@
-"""Reference collector — parsing against real tool-rendering shapes (the kb
-fixture format, the Exa text format) + a full-engine collection journey."""
+"""Reference collector — the numbering authority: turn-global renumbering of
+real tool-rendering shapes (kb_search._render, Exa text), per-FILE numbers,
+the n -> source map, and a full-engine journey where the model cites what
+it was shown."""
 
 import pytest
 
+from turnstile.capabilities.persistence.memory_store import MemorySessionStore
 from turnstile.kernel.dtos import (
     AfterOutcome,
     BeforeOutcome,
     Done,
+    Role,
     TextDelta,
     ToolCall,
     ToolCallEvent,
@@ -20,12 +24,19 @@ from turnstile.products.middleware.references import Reference, ReferenceCollect
 
 pytestmark = pytest.mark.unit
 
-# real rendering shapes (kb_search._render / Exa LLM-ready text)
+# real rendering shapes (kb_search._render with region prefix / Exa text)
 KB_CONTENT = (
-    "[1] Benefits/FTNT 2026 OE Webinar FAQ Final v2.pdf#L521 (score 0.033)\n"
+    "[1] hrus::Benefits/FTNT 2026 OE Webinar FAQ Final v2.pdf#L521 (score 0.033)\n"
     "Q: Is there a specific paternity leave policy?\n\n"
-    "[2] Handbook & Labor Postings/2024 Handbook.pdf#L613 (score 0.016)\n"
+    "[2] hrus::Handbook & Labor Postings/2024 Handbook.pdf#L613 (score 0.016)\n"
     "Following is a brief description of employee benefits."
+)
+# a second call: one NEW document plus another chunk of a doc already seen
+KB_CONTENT_2 = (
+    "[1] hrus::Benefits/FTNT 2026 OE Webinar FAQ Final v2.pdf#L88 (score 0.041)\n"
+    "Q: How is PTO accrued?\n\n"
+    "[2] hrus::Holidays/2026 Holiday Calendar.pdf#L3 (score 0.020)\n"
+    "Fixed holidays are listed below."
 )
 WEB_CONTENT = (
     'Search results for "leave policy":\n\n'
@@ -38,6 +49,10 @@ WEB_CONTENT = (
     "Highlights:\nFederal leave law..."
 )
 
+FAQ = "Benefits/FTNT 2026 OE Webinar FAQ Final v2.pdf"
+HANDBOOK = "Handbook & Labor Postings/2024 Handbook.pdf"
+CALENDAR = "Holidays/2026 Holiday Calendar.pdf"
+
 
 class _NamedTool(EchoTool):
     def __init__(self, name: str) -> None:
@@ -47,58 +62,120 @@ class _NamedTool(EchoTool):
         return self._name
 
 
-async def _seen(collector: ReferenceCollector, tool_name: str, content: str, **kw) -> None:
-    call = ToolCall(id=f"c-{tool_name}", name=tool_name, arguments="{}")
+async def _seen(collector: ReferenceCollector, tool_name: str, content: str, **kw) -> ToolResult:
+    """Run one tool result through the collector; returns the (possibly
+    rewritten) result so tests can inspect what the model would see."""
+    call = ToolCall(id=f"c-{tool_name}-{len(content)}", name=tool_name, arguments="{}")
     assert await collector.before(call, _NamedTool(tool_name), None) is BeforeOutcome.PROCEED
     result = ToolResult(call_id=call.id, content=content, **kw)
     assert await collector.after(result) is AfterOutcome.PROCEED
+    return result
 
 
-# ── parsing ────────────────────────────────────────────────────────────
+# ── parsing + the map ──────────────────────────────────────────────────
 
 
-async def test_kb_refs_parse_from_the_real_rendering():
+async def test_kb_headers_parse_into_numbered_references():
     collector = ReferenceCollector()
     await _seen(collector, "kb_search", KB_CONTENT)
     assert collector.take() == [
-        Reference(tool="kb_search", ref="Benefits/FTNT 2026 OE Webinar FAQ Final v2.pdf#L521"),
-        Reference(tool="kb_search", ref="Handbook & Labor Postings/2024 Handbook.pdf#L613"),
+        Reference(n=1, tool="kb_search", ref=FAQ, region="hrus", fragment="L521"),
+        Reference(n=2, tool="kb_search", ref=HANDBOOK, region="hrus", fragment="L613"),
     ]
 
 
-async def test_web_titles_and_urls_parse_from_the_exa_shape():
+async def test_web_titles_and_urls_parse_and_get_numbers_too():
     collector = ReferenceCollector()
-    await _seen(collector, "web_search", WEB_CONTENT)
+    result = await _seen(collector, "web_search", WEB_CONTENT)
     references = collector.take()
     assert references[0] == Reference(
+        n=1,
         tool="web_search",
         ref="Time Off and Leaves",
         url="https://fortinet.sharepoint.com/sites/HRUS/SitePages/Time-Off.aspx",
     )
-    assert references[1].url == "https://www.dol.gov/agencies/whd/fmla"
+    assert references[1].n == 2 and references[1].url == "https://www.dol.gov/agencies/whd/fmla"
+    # the model sees the numbers stamped onto the title lines
+    assert "[1] Title: Time Off and Leaves" in result.content
+    assert "[2] Title: FMLA overview" in result.content
 
 
-async def test_duplicates_collapse_errors_and_unlisted_tools_are_skipped():
+# ── the numbering authority ────────────────────────────────────────────
+
+
+async def test_second_call_continues_numbering_instead_of_colliding():
+    collector = ReferenceCollector()
+    first = await _seen(collector, "kb_search", KB_CONTENT)
+    second = await _seen(collector, "kb_search", KB_CONTENT_2)
+
+    # what the model sees: no two documents share a number across calls
+    assert first.content.startswith(f"[1] hrus::{FAQ}#L521 (score 0.033)")
+    assert f"\n\n[2] hrus::{HANDBOOK}#L613" in first.content
+    assert second.content.startswith(f"[1] hrus::{FAQ}#L88")  # same doc -> same number
+    assert f"\n\n[3] hrus::{CALENDAR}#L3" in second.content  # new doc -> next number
+
+    # the map: three documents, per FILE — the FAQ's second chunk added
+    # nothing new and keeps the first-cited anchor
+    references = collector.take()
+    assert [(r.n, r.ref) for r in references] == [(1, FAQ), (2, HANDBOOK), (3, CALENDAR)]
+    assert references[0].fragment == "L521"
+
+
+async def test_numbering_is_per_file_not_per_chunk():
+    collector = ReferenceCollector()
+    two_chunks = (
+        "[1] hrus::pto.md#L12 (score 0.910)\nPTO accrues at 1.5 days/month.\n\n"
+        "[2] hrus::pto.md#L40 (score 0.840)\nCarry-over caps at 10 days."
+    )
+    result = await _seen(collector, "kb_search", two_chunks)
+    assert "[1] hrus::pto.md#L12" in result.content
+    assert "[1] hrus::pto.md#L40" in result.content  # same document, same number
+    assert "[2]" not in result.content
+    assert [(r.n, r.ref, r.fragment) for r in collector.take()] == [(1, "pto.md", "L12")]
+
+
+async def test_kb_and_web_share_one_number_space():
     collector = ReferenceCollector()
     await _seen(collector, "kb_search", KB_CONTENT)
-    await _seen(collector, "kb_search", KB_CONTENT)  # re-hit: same refs
-    await _seen(collector, "kb_search", "[9] broken.pdf#L1 (score 0.5)\nboom", is_error=True)
-    await _seen(collector, "calculator", "Title: not a search\nURL: https://x")
-    references = collector.take()
-    assert len(references) == 2  # deduped; error + unlisted tool contributed nothing
+    web = await _seen(collector, "web_search", WEB_CONTENT)
+    assert "[3] Title: Time Off and Leaves" in web.content  # continues after the two kb docs
+    assert [r.n for r in collector.take()] == [1, 2, 3, 4]
 
 
-async def test_take_drains_for_the_next_turn():
+async def test_region_less_refs_still_number():
+    # a collection whose doc_id carries no "<region>#" prefix renders bare
+    collector = ReferenceCollector()
+    await _seen(collector, "kb_search", "[1] docs/guide.md#L5 (score 0.5)\ntext")
+    assert collector.take() == [
+        Reference(n=1, tool="kb_search", ref="docs/guide.md", region=None, fragment="L5")
+    ]
+
+
+async def test_errors_and_unlisted_tools_are_left_alone():
+    collector = ReferenceCollector()
+    err = await _seen(collector, "kb_search", "[9] broken.pdf#L1 (score 0.5)\nboom", is_error=True)
+    other = await _seen(collector, "calculator", "Title: not a search\nURL: https://x")
+    assert err.content.startswith("[9] broken.pdf")  # untouched
+    assert other.content.startswith("Title: not a search")  # untouched
+    assert collector.take() == []
+
+
+async def test_take_drains_and_numbering_restarts_next_turn():
     collector = ReferenceCollector()
     await _seen(collector, "kb_search", KB_CONTENT)
     assert len(collector.take()) == 2
     assert collector.take() == []  # drained
+    result = await _seen(collector, "kb_search", KB_CONTENT_2)
+    assert result.content.startswith("[1] ")  # a new turn starts at 1 again
 
 
 # ── full-engine journey ────────────────────────────────────────────────
 
 
 class _KbDouble(Tool):
+    def __init__(self) -> None:
+        self.calls = 0
+
     def name(self) -> str:
         return "kb_search"
 
@@ -112,22 +189,37 @@ class _KbDouble(Tool):
         return True
 
     async def execute(self, args: str, ctx: ToolContext) -> ToolResult:
-        return ToolResult(call_id="", content=KB_CONTENT)
+        self.calls += 1
+        return ToolResult(call_id="", content=KB_CONTENT if self.calls == 1 else KB_CONTENT_2)
 
 
-async def test_collector_harvests_during_a_real_turn():
+async def test_model_sees_renumbered_excerpts_across_a_real_turn():
     provider = ScriptedProvider(
         rounds=[
             [ToolCallEvent(ToolCall("c1", "kb_search", '{"query": "leave"}')), Done()],
-            [TextDelta("Per the FAQ, leave accrues [1]."), Done()],
+            [ToolCallEvent(ToolCall("c2", "kb_search", '{"query": "holidays"}')), Done()],
+            [TextDelta("Leave accrues per the FAQ [1]; holidays are fixed [3]."), Done()],
         ]
     )
     collector = ReferenceCollector()
-    agent = Agent(provider=provider, tools={"kb_search": _KbDouble()}, middleware=[collector])
-    outcome = await agent.run_to_completion("leave benefits?")
-    assert "leave accrues" in outcome.text
-    refs = [r.ref for r in collector.take()]
-    assert refs == [
-        "Benefits/FTNT 2026 OE Webinar FAQ Final v2.pdf#L521",
-        "Handbook & Labor Postings/2024 Handbook.pdf#L613",
-    ]
+    store = MemorySessionStore()
+    agent = Agent(
+        provider=provider,
+        tools={"kb_search": _KbDouble()},
+        middleware=[collector],
+        hooks=[store.hook("s")],
+        session_id="s",
+    )
+    outcome = await agent.run_to_completion("leave and holidays?")
+    assert "[3]" in outcome.text
+
+    # the tool messages the model read (as persisted) carry turn-global numbers
+    snapshot = store.load("s")
+    assert snapshot is not None
+    tool_texts = [m.text for m in snapshot.messages if m.role is Role.TOOL]
+    assert tool_texts[0].startswith(f"[1] hrus::{FAQ}#L521")
+    assert f"[3] hrus::{CALENDAR}#L3" in tool_texts[1]
+
+    # and the map resolves what the model cited, by number
+    by_n = {r.n: r for r in collector.take()}
+    assert by_n[1].ref == FAQ and by_n[3].ref == CALENDAR

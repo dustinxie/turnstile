@@ -68,6 +68,8 @@ def test_persona_pins_kb_first_and_no_invention():
     persona = SupportBotSpec().persona(CFG)
     assert "kb_search first" in persona
     assert "never invent" in persona
+    # citations: echo the server-assigned [n], never a hand-written source list
+    assert "bracketed number" in persona and "Do not write your own list of sources" in persona
 
 
 def test_chat_options_pin_zero_temperature():
