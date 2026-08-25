@@ -2,9 +2,12 @@
 
 Everything a chat client needs to FINISH rendering a turn, in one frame:
 the final answer (from the snapshot, so a judge-retried turn reports the
-accepted answer, never a concatenation of drafts), a deterministic quality
-`signal`, and the ground-truth `references` drained from the collector (the
-L2-collector pattern, kernel-loop-structure.md §I.2).
+accepted answer, never a concatenation of drafts) with its References
+section appended, a deterministic quality `signal`, and the ground-truth
+`references` list — both produced by the reference collector's turn-end
+touchpoint (the L2-collector pattern, kernel-loop-structure.md §I.2): the
+model's inline [n] resolve by number against the collector's map, and file
+links are minted here with the requesting principal (recipient-bound).
 
 The signal is ENDPOINT-SET, never model-claimed:
   no_answer    - the turn did not end cleanly (cancel / fuse / error), or
@@ -20,6 +23,7 @@ Judge and references arrive duck-typed off the AssembledAgent bundle — the
 service never imports product classes (the c6 contract).
 """
 
+from collections.abc import Callable
 from typing import Any
 
 from turnstile.kernel.dtos import Role, SessionSnapshot
@@ -41,10 +45,20 @@ def build_envelope(
     snapshot: SessionSnapshot | None,
     stop_reason: str,
     judge: Any = None,
-    references: list[Any] | None = None,
+    references: Any = None,
+    link: Callable[[Any], str | None] = lambda reference: reference.url,
 ) -> dict:
+    """`references` is the collector (duck-typed: finish(answer, link)) or
+    None when the deployment wired none — then the answer passes through
+    untouched and the list is empty: the lego piece is simply absent."""
     answer = final_answer(snapshot)
     verdict = getattr(judge, "last_verdict", None)
+    structured: list[dict] = []
+    if references is not None and answer:
+        # the collector's turn-end touchpoint: resolves the model's inline
+        # [n] by number, appends the References section, mints links via
+        # `link` (the driver's — file tokens are recipient-bound)
+        answer, structured = references.finish(answer, link)
 
     if stop_reason != "stopped" or not answer:
         signal = "no_answer"
@@ -60,6 +74,6 @@ def build_envelope(
         "answer": answer,
         "signal": signal,
         "score": getattr(verdict, "score", None),
-        "references": [{"tool": r.tool, "ref": r.ref, "url": r.url} for r in (references or [])],
+        "references": structured,  # [{n, title, url, cited}] — every numbered doc
         "stop_reason": stop_reason,
     }

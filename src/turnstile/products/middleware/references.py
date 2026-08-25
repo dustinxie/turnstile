@@ -122,8 +122,63 @@ class ReferenceCollector(ToolMiddleware):
     def take(self) -> list[Reference]:
         """Drain: every document numbered this turn, in number order, clearing
         state for the next turn. The driver calls this once after TurnComplete
-        (the envelope build)."""
+        (the envelope build), or via finish()."""
         references = sorted(self._by_key.values(), key=lambda r: r.n)
         self._by_key.clear()
         self._tool_by_call.clear()
         return references
+
+    def finish(
+        self, answer: str, link: Callable[[Reference], str | None]
+    ) -> tuple[str, list[dict]]:
+        """The turn-end touchpoint: the ACCEPTED answer in, the answer with its
+        References section out, plus the structured list for the envelope.
+
+        Inline "[n]" markers resolve by NUMBER against this turn's map — the
+        model only ever echoes numbers it was shown; one it invents has no
+        entry and stays plain text. The section lists only documents the
+        body actually cites (the bibliography rule), while the returned list
+        carries EVERY numbered document with a `cited` flag — what the
+        retrieval surfaced is ground truth whether or not the model used it.
+        A source list the model wrote anyway is dropped: ours is
+        authoritative. `link` is the driver's: it turns a Reference into an
+        openable URL (file tokens need the requesting principal, which only
+        the driver knows) — this class never touches secrets or config.
+        Drains the collector like take()."""
+        references = self.take()
+        body = _OWN_SOURCES_RE.sub("", answer).rstrip()
+        cited = {int(n) for n in _INLINE_CITE_RE.findall(body)}
+
+        structured = [
+            {"n": r.n, "title": _title(r), "url": link(r), "cited": r.n in cited}
+            for r in references
+        ]
+        # One list item per document: consecutive bare lines would be ONE
+        # markdown paragraph (soft breaks) and render run together.
+        lines = [
+            f"- [{e['n']}] [{e['title']}]({e['url']})"
+            if e["url"]
+            else f"- [{e['n']}] {e['title']}"
+            for e in structured
+            if e["cited"]
+        ]
+        if lines:
+            body = f"{body}\n\n### References\n" + "\n".join(lines)
+        return body, structured
+
+
+# Any inline "[n]" citation marker in the answer body.
+_INLINE_CITE_RE = re.compile(r"\[(\d+)\]")
+# A source list the model wrote despite instructions: a trailing "### Sources"
+# / "### References" heading (any level) through end of text.
+_OWN_SOURCES_RE = re.compile(
+    r"\n#{1,6}\s+(?:Sources?|References?)\s*\n.*\Z", re.DOTALL | re.IGNORECASE
+)
+
+
+def _title(reference: Reference) -> str:
+    """kb: the document's file name (the path is a store detail); web: the
+    page title."""
+    if reference.tool == "kb_search":
+        return reference.ref.rsplit("/", 1)[-1]
+    return reference.ref

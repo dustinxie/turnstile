@@ -169,6 +169,81 @@ async def test_take_drains_and_numbering_restarts_next_turn():
     assert result.content.startswith("[1] ")  # a new turn starts at 1 again
 
 
+# ── the turn-end touchpoint: finish() ──────────────────────────────────
+
+
+def _link(reference: Reference) -> str | None:
+    """A driver-style link: web keeps its URL, kb docs get a fake token URL."""
+    if reference.url:
+        return reference.url
+    return f"/v1/files/tok-{reference.n}" + (
+        f"#{reference.fragment}" if reference.fragment else ""
+    )
+
+
+async def test_finish_appends_a_references_section_for_cited_numbers_only():
+    collector = ReferenceCollector()
+    await _seen(collector, "kb_search", KB_CONTENT)
+    await _seen(collector, "kb_search", KB_CONTENT_2)  # -> [3] calendar
+    answer, structured = collector.finish(
+        "Leave accrues per the FAQ [1]; holidays are fixed [3].", _link
+    )
+
+    assert answer == (
+        "Leave accrues per the FAQ [1]; holidays are fixed [3].\n\n"
+        "### References\n"
+        "- [1] [FTNT 2026 OE Webinar FAQ Final v2.pdf](/v1/files/tok-1#L521)\n"
+        "- [3] [2026 Holiday Calendar.pdf](/v1/files/tok-3#L3)"
+    )
+    # the structured list carries EVERY numbered doc; the uncited handbook
+    # is ground truth of retrieval, flagged rather than dropped
+    assert structured == [
+        {
+            "n": 1,
+            "title": "FTNT 2026 OE Webinar FAQ Final v2.pdf",
+            "url": "/v1/files/tok-1#L521",
+            "cited": True,
+        },
+        {"n": 2, "title": "2024 Handbook.pdf", "url": "/v1/files/tok-2#L613", "cited": False},
+        {"n": 3, "title": "2026 Holiday Calendar.pdf", "url": "/v1/files/tok-3#L3", "cited": True},
+    ]
+    assert collector.take() == []  # finish drains like take
+
+
+async def test_finish_resolves_by_number_never_by_name():
+    collector = ReferenceCollector()
+    await _seen(collector, "kb_search", KB_CONTENT)
+    # the model paraphrases the document ("the FAQ") and invents [7]
+    answer, structured = collector.finish("Per the FAQ [2] and elsewhere [7].", _link)
+    assert "- [2] [2024 Handbook.pdf]" in answer  # [2] IS the handbook, whatever the prose says
+    assert "[7]" in answer and "tok-7" not in answer  # hallucinated: plain text, no source line
+    assert [e["cited"] for e in structured] == [False, True]
+
+
+async def test_finish_drops_the_models_own_source_list():
+    collector = ReferenceCollector()
+    await _seen(collector, "kb_search", KB_CONTENT)
+    disobedient = (
+        "Leave accrues [1].\n\n### Sources\n[1] some-made-up-name.pdf\n[2] not even retrieved.pdf"
+    )
+    answer, _ = collector.finish(disobedient, _link)
+    assert "made-up" not in answer and "not even retrieved" not in answer
+    assert answer.count("### ") == 1  # exactly our section
+    assert answer.endswith("- [1] [FTNT 2026 OE Webinar FAQ Final v2.pdf](/v1/files/tok-1#L521)")
+
+
+async def test_finish_without_citations_or_links_stays_plain():
+    collector = ReferenceCollector()
+    await _seen(collector, "kb_search", KB_CONTENT)
+    answer, structured = collector.finish("I could not find that.", _link)
+    assert answer == "I could not find that."  # nothing cited -> no section
+    assert all(not e["cited"] for e in structured) and len(structured) == 2
+
+    await _seen(collector, "web_search", WEB_CONTENT)
+    answer, _ = collector.finish("See the policy page [1].", lambda r: None)  # driver: no links
+    assert answer.endswith("### References\n- [1] Time Off and Leaves")  # plain title, no link
+
+
 # ── full-engine journey ────────────────────────────────────────────────
 
 

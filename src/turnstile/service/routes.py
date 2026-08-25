@@ -17,6 +17,7 @@ import json
 import re
 from dataclasses import asdict, is_dataclass
 from enum import Enum
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -26,6 +27,7 @@ from sse_starlette.sse import EventSourceResponse
 from turnstile.kernel import events as ev
 from turnstile.service.auth import require_user
 from turnstile.service.envelope import build_envelope
+from turnstile.service.files import mint_file_token
 
 router = APIRouter()
 
@@ -106,7 +108,8 @@ async def post_message(
                         entry.bundle.store.load(conversation_id),
                         stop_reason=event.reason.value,
                         judge=entry.bundle.judge,
-                        references=entry.bundle.references.take(),
+                        references=entry.bundle.references,
+                        link=_file_link(request, principal),
                     )
                     yield {"event": "envelope", "data": json.dumps(envelope)}
                     entry.in_flight = False  # clean end: the slot frees here
@@ -121,6 +124,27 @@ async def post_message(
             raise
 
     return EventSourceResponse(stream())
+
+
+def _file_link(request: Request, principal: str):
+    """The driver's half of citation links: a Reference -> openable URL. Web
+    sources carry their own URL; kb documents get a recipient-bound file
+    token (files.py) when a file store is configured, else no link — the
+    References section then lists them as plain titles."""
+    cfg: Any = request.app.state.cfg
+    file_root = getattr(cfg, "file_root", None)
+    secret = getattr(cfg, "jwt_secret", None)
+
+    def link(reference: Any) -> str | None:
+        if reference.url:
+            return reference.url
+        if not file_root or not reference.region or not reference.ref:
+            return None
+        token = mint_file_token(secret, reference.region, reference.ref, principal)
+        anchor = f"#{reference.fragment}" if reference.fragment else ""
+        return f"/v1/files/{token}{anchor}"
+
+    return link
 
 
 # Strong refs to detached drainers (a bare create_task is GC-bait).

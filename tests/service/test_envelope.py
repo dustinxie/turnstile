@@ -80,10 +80,23 @@ def test_answer_is_the_accepted_one_not_a_draft_concat():
     assert envelope["answer"] == "the accepted answer"
 
 
+def test_no_collector_means_answer_untouched_and_no_references():
+    # the lego piece is absent (root wired no collector): the model's inline
+    # markers stay as typed, no section, empty list
+    envelope = build_envelope(
+        "c", _snap(Message.user("q"), Message.assistant("see [1]")), "stopped"
+    )
+    assert envelope["answer"] == "see [1]"
+    assert envelope["references"] == []
+
+
 # ── streamed journeys ──────────────────────────────────────────────────
 
 
 class _KbDouble(Tool):
+    def __init__(self, content: str = KB_CONTENT) -> None:
+        self._content = content
+
     def name(self) -> str:
         return "kb_search"
 
@@ -97,14 +110,15 @@ class _KbDouble(Tool):
         return True
 
     async def execute(self, args: str, ctx: ToolContext) -> ToolResult:
-        return ToolResult(call_id="", content=KB_CONTENT)
+        return ToolResult(call_id="", content=self._content)
 
 
-def _app(provider_factory, judge_factory=None):
+def _app(provider_factory, judge_factory=None, kb_content=KB_CONTENT, file_root=None):
     from turnstile.config import Config
 
     cfg = Config(
         _env_file=None,  # type: ignore[call-arg]
+        file_root=file_root,
         llm={"base_url": "https://ds4.example/v1", "model": "model-fast"},
         kb={
             "embedding_url": "https://e/x",
@@ -120,7 +134,7 @@ def _app(provider_factory, judge_factory=None):
         judge = judge_factory() if judge_factory else None
         agent = Agent(
             provider=provider_factory(),
-            tools={"kb_search": _KbDouble()},
+            tools={"kb_search": _KbDouble(kb_content)},
             hooks=([judge] if judge else []) + [store.hook(session_id)],
             middleware=[references],
             session_id=session_id,
@@ -161,7 +175,7 @@ async def test_unjudged_turn_streams_live_and_closes_with_the_envelope():
         lambda: ScriptedProvider(
             rounds=[
                 [ToolCallEvent(ToolCall("t1", "kb_search", '{"query": "v"}')), Done()],
-                [TextDelta("the "), TextDelta("answer"), Done()],
+                [TextDelta("the "), TextDelta("answer [1]"), Done()],
             ]
         )
     )
@@ -170,11 +184,42 @@ async def test_unjudged_turn_streams_live_and_closes_with_the_envelope():
     assert "text_delta" in names  # no judge -> live streaming
     assert names[-2:] == ["turn_complete", "envelope"]  # envelope closes the stream
     envelope = events[-1][1]
-    assert envelope["answer"] == "the answer"
+    # the References section rides the envelope's answer; no file store and
+    # no region in this fixture -> a plain (unlinked) title
+    assert envelope["answer"] == "the answer [1]\n\n### References\n- [1] Handbook.pdf"
     assert envelope["signal"] == "unjudged" and envelope["score"] is None
     assert envelope["references"] == [
-        {"tool": "kb_search", "ref": "Handbook.pdf", "url": None}  # path; anchor is separate
+        {"n": 1, "title": "Handbook.pdf", "url": None, "cited": True}
     ]
+    await app.state.registry.shutdown_all()
+
+
+async def test_cited_kb_docs_link_to_recipient_bound_file_tokens(tmp_path):
+    # a real store: the cited doc exists under <root>/<region>/<path>
+    (tmp_path / "hrus" / "Policies").mkdir(parents=True)
+    (tmp_path / "hrus" / "Policies" / "Handbook.pdf").write_bytes(b"%PDF handbook")
+    kb = "[1] hrus::Policies/Handbook.pdf#L755 (score 0.033)\nVacation policy text."
+    app = _app(
+        lambda: ScriptedProvider(
+            rounds=[
+                [ToolCallEvent(ToolCall("t1", "kb_search", "{}")), Done()],
+                [TextDelta("Vacation is covered [1]."), Done()],
+            ]
+        ),
+        kb_content=kb,
+        file_root=str(tmp_path),
+    )
+    events = await _post_stream(app, "c1", "q")
+    envelope = events[-1][1]
+    (reference,) = envelope["references"]
+    assert reference["title"] == "Handbook.pdf" and reference["cited"] is True
+    assert reference["url"].startswith("/v1/files/") and reference["url"].endswith("#L755")
+    assert f"- [1] [Handbook.pdf]({reference['url']})" in envelope["answer"]  # list item, md link
+
+    # the link opens for the principal it was minted for (dev mode: anonymous)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        served = await c.get(reference["url"].split("#", 1)[0])
+    assert served.status_code == 200 and served.content == b"%PDF handbook"
     await app.state.registry.shutdown_all()
 
 
