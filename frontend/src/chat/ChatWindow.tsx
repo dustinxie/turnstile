@@ -5,6 +5,7 @@
  */
 import { useEffect, useRef, useState, type KeyboardEvent } from 'react'
 import type { Signal } from '../api/types'
+import { Markdown } from './Markdown'
 import type { ConversationState, Message } from './useConversation'
 
 const SIGNAL_STYLE: Record<Signal, string> = {
@@ -39,11 +40,17 @@ function Bubble({ message }: { message: Message }) {
     <div className={`flex ${mine ? 'justify-end' : 'justify-start'}`}>
       <div
         data-role={message.role}
-        className={`max-w-[80%] whitespace-pre-wrap rounded-2xl px-4 py-2 text-sm ${
-          mine ? 'bg-blue-600 text-white' : 'bg-white text-neutral-900 shadow-sm'
+        className={`max-w-[80%] rounded-2xl px-4 py-2 text-sm ${
+          mine
+            ? 'whitespace-pre-wrap bg-blue-600 text-white'
+            : 'bg-white text-neutral-900 shadow-sm'
         }`}
       >
-        {message.text}
+        {mine ? (
+          message.text
+        ) : (
+          <Markdown text={message.text} references={message.envelope?.references} />
+        )}
         {message.envelope && (
           <div className="mt-2">
             <SignalBadge signal={message.envelope.signal} score={message.envelope.score} />
@@ -96,9 +103,11 @@ export function ChatWindow({ state, onSend, onStop }: Props) {
           <div className="flex justify-start">
             <div
               data-testid="draft"
-              className="max-w-[80%] whitespace-pre-wrap rounded-2xl bg-white px-4 py-2 text-sm shadow-sm"
+              className="max-w-[80%] rounded-2xl bg-white px-4 py-2 text-sm shadow-sm"
             >
-              {state.draft || (
+              {state.draft ? (
+                <Markdown text={state.draft} />
+              ) : (
                 <span className="text-neutral-400">{state.activity ?? 'thinking…'}</span>
               )}
               {state.draft && state.activity && (

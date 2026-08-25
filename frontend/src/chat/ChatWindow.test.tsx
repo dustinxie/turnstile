@@ -35,11 +35,13 @@ test('streams text live, then the envelope replaces the draft with the accepted 
 
   // the user's bubble is there immediately
   expect(screen.getByText('what is my leave benefits')).toBeInTheDocument()
-  // the final bubble is the ENVELOPE's answer (with the References section),
-  // not a concat of deltas
-  const answer = await screen.findByText(/### References/)
-  expect(answer).toHaveTextContent('the answer [1]')
-  expect(answer.closest('[data-role="assistant"]')).not.toBeNull()
+  // the final bubble is the ENVELOPE's answer (with the References section
+  // rendered as markdown), not a concat of deltas
+  const heading = await screen.findByRole('heading', { name: 'References' })
+  const bubble = heading.closest('[data-role="assistant"]')
+  expect(bubble).not.toBeNull()
+  expect(bubble).toHaveTextContent('the answer [1]')
+  expect(bubble).toHaveTextContent('[1] Handbook.pdf')
   expect(screen.getByTestId('signal')).toHaveAttribute('data-signal', 'unjudged')
   expect(screen.getByTestId('signal')).toHaveTextContent('unchecked')
   // the composer is back to idle
