@@ -1,8 +1,16 @@
 /**
  * The one screen: a history panel on the left, the conversation on the right.
- * F1 ships the empty shell; F2 fills the chat window, F4 the history panel.
+ * F2: the chat window is live against a fresh conversation id per page load
+ * (the client picks the id; the first POST claims it). F4 fills the panel.
  */
+import { useState } from 'react'
+import { ChatWindow } from './chat/ChatWindow'
+import { useConversation } from './chat/useConversation'
+
 export default function App() {
+  const [conversationId] = useState(() => crypto.randomUUID())
+  const { state, send, stop } = useConversation(conversationId)
+
   return (
     <div className="flex h-full bg-neutral-50 text-neutral-900">
       <aside
@@ -17,9 +25,7 @@ export default function App() {
         </div>
       </aside>
       <main aria-label="conversation" className="flex min-w-0 flex-1 flex-col">
-        <div className="flex flex-1 items-center justify-center text-neutral-400">
-          Ask a question to start a conversation.
-        </div>
+        <ChatWindow state={state} onSend={send} onStop={stop} />
       </main>
     </div>
   )
