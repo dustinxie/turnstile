@@ -1,8 +1,11 @@
 """AuthN + conversation ownership — 401 paths, the anonymous dev mode, and
-foreign conversations answering 404 (never 403: existence must not leak)."""
+foreign conversations answering 404 (never 403: existence must not leak).
+Plus the flat authorization model: the signed role claim and the admin gate
+(401 = not authenticated, 403 = authenticated but not admin)."""
 
 import httpx
 import pytest
+from fastapi import Depends
 
 from turnstile.capabilities.persistence.memory_store import MemorySessionStore
 from turnstile.kernel.dtos import Done, TextDelta
@@ -11,7 +14,7 @@ from turnstile.kernel.testkit import ScriptedProvider
 from turnstile.products.middleware.references import ReferenceCollector
 from turnstile.root import AssembledAgent
 from turnstile.service.app import create_app
-from turnstile.service.auth import mint_token
+from turnstile.service.auth import mint_token, require_admin
 from turnstile.service.registry import ConversationRegistry
 
 pytestmark = pytest.mark.service
@@ -47,6 +50,13 @@ def _app(jwt_secret: str | None):
     app = create_app(cfg)
     app.state.store = store
     app.state.registry = ConversationRegistry(cfg, store, assemble=scripted_assemble)
+
+    # Stand-in for the future admin-only surface: no production route uses
+    # require_admin yet, so the gate is proven on a probe route here.
+    @app.get("/admin-probe")
+    async def admin_probe(principal: str = Depends(require_admin)) -> dict:  # pyright: ignore[reportUnusedFunction]
+        return {"admin": principal}
+
     return app
 
 
@@ -54,8 +64,8 @@ def _client(app) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t")
 
 
-def _bearer(user: str, secret: str = SECRET, ttl: int = 3600) -> dict:
-    return {"Authorization": f"Bearer {mint_token(secret, user, ttl)}"}
+def _bearer(user: str, secret: str = SECRET, ttl: int = 3600, role: str = "user") -> dict:
+    return {"Authorization": f"Bearer {mint_token(secret, user, ttl, role=role)}"}
 
 
 async def _post(client, cid: str, headers: dict | None = None) -> int:
@@ -102,6 +112,54 @@ async def test_health_stays_open():
     app = _app(jwt_secret=SECRET)
     async with _client(app) as client:
         assert (await client.get("/health")).status_code == 200  # container probes
+
+
+# ── the role claim + admin gate ────────────────────────────────────────
+
+
+async def test_admin_token_passes_the_gate():
+    app = _app(jwt_secret=SECRET)
+    async with _client(app) as client:
+        response = await client.get("/admin-probe", headers=_bearer("alice", role="admin"))
+    assert response.status_code == 200
+    assert response.json() == {"admin": "alice"}
+
+
+async def test_user_role_is_403_not_401():
+    # a real identity that isn't admin: authenticated (not 401), forbidden.
+    # The role is SIGNED into the token — a client cannot elevate itself.
+    app = _app(jwt_secret=SECRET)
+    async with _client(app) as client:
+        assert (await client.get("/admin-probe", headers=_bearer("bob"))).status_code == 403
+        # default mint role is "user" — an unspecified role never elevates
+        headers = {"Authorization": f"Bearer {mint_token(SECRET, 'bob', 3600)}"}
+        assert (await client.get("/admin-probe", headers=headers)).status_code == 403
+
+
+async def test_admin_gate_still_authenticates_first():
+    app = _app(jwt_secret=SECRET)
+    async with _client(app) as client:
+        assert (await client.get("/admin-probe")).status_code == 401  # no token
+        wrong = "wrong-secret-0123456789abcdef-01234567"
+        forged = _bearer("mallory", secret=wrong, role="admin")  # wrong key -> dead
+        assert (await client.get("/admin-probe", headers=forged)).status_code == 401
+
+
+async def test_dev_mode_has_no_admin():
+    # auth off: user surfaces run anonymous, but there is no identity to
+    # elevate — admin surfaces stay closed until real auth is configured
+    app = _app(jwt_secret=None)
+    async with _client(app) as client:
+        assert (await client.get("/admin-probe")).status_code == 403
+
+
+async def test_role_claim_does_not_disturb_user_routes():
+    # an admin token is still a valid user token for ordinary surfaces
+    app = _app(jwt_secret=SECRET)
+    async with _client(app) as client:
+        assert await _post(client, "c1", _bearer("alice", role="admin")) == 200
+        assert app.state.store.owner("c1") == "alice"
+    await app.state.registry.shutdown_all()
 
 
 # ── ownership ──────────────────────────────────────────────────────────

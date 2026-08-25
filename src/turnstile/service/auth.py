@@ -27,24 +27,22 @@ ANONYMOUS = "anonymous"
 _ALGORITHM = "HS256"
 
 
-def mint_token(secret: str, sub: str, ttl_seconds: int = 24 * 3600) -> str:
+def mint_token(secret: str, sub: str, ttl_seconds: int = 24 * 3600, role: str = "user") -> str:
     """A signed credential for `sub` — the ONE minting path: the by-hand
-    one-liner above, the future SSO login route, and the tests."""
+    one-liner above, the future SSO login route, and the tests.
+
+    `role` is the flat authorization model (user | admin): signed into the
+    token so the client cannot forge it, read by require_admin. Deliberately
+    NOT an RBAC framework — per-resource permissions stay deferred to the
+    RBAC middleware (arrives with the first side-effecting tool)."""
     now = int(time.time())
-    return jwt.encode({"sub": sub, "iat": now, "exp": now + ttl_seconds}, secret, _ALGORITHM)
+    claims = {"sub": sub, "role": role, "iat": now, "exp": now + ttl_seconds}
+    return jwt.encode(claims, secret, _ALGORITHM)
 
 
-async def require_user(request: Request) -> str:
-    """FastAPI dependency: the verified principal for this request.
-
-    Auth off (no jwt_secret) -> ANONYMOUS. Auth on -> a valid, unexpired
-    Bearer JWT is required; anything else is 401 (one generic detail — no
-    oracle for which check failed)."""
-    cfg: Any = request.app.state.cfg  # duck-typed, same discipline as everywhere
-    secret = getattr(cfg, "jwt_secret", None)
-    if not secret:
-        return ANONYMOUS
-
+def _verify_claims(request: Request, secret: str) -> dict:
+    """Parse + verify the request's Bearer JWT. Any failure is 401 (one
+    generic detail — no oracle for which check failed)."""
     header = request.headers.get("authorization", "")
     scheme, _, token = header.partition(" ")
     if scheme.lower() != "bearer" or not token:
@@ -56,4 +54,32 @@ async def require_user(request: Request) -> str:
     sub = claims.get("sub")
     if not isinstance(sub, str) or not sub:
         raise HTTPException(status_code=401, detail="invalid token")
-    return sub
+    return claims
+
+
+async def require_user(request: Request) -> str:
+    """FastAPI dependency: the verified principal for this request.
+
+    Auth off (no jwt_secret) -> ANONYMOUS. Auth on -> a valid, unexpired
+    Bearer JWT is required; anything else is 401."""
+    cfg: Any = request.app.state.cfg  # duck-typed, same discipline as everywhere
+    secret = getattr(cfg, "jwt_secret", None)
+    if not secret:
+        return ANONYMOUS
+    return _verify_claims(request, secret)["sub"]
+
+
+async def require_admin(request: Request) -> str:
+    """FastAPI dependency for the few admin-only routes: require_user's
+    verification PLUS the role claim. 401 = not authenticated; 403 = a real
+    identity that simply isn't admin (role is signed — a client cannot
+    elevate itself). Dev mode (auth off) has no identity to elevate -> 403:
+    admin surfaces need real auth even where user surfaces run anonymous."""
+    cfg: Any = request.app.state.cfg
+    secret = getattr(cfg, "jwt_secret", None)
+    if not secret:
+        raise HTTPException(status_code=403, detail="admin only")
+    claims = _verify_claims(request, secret)
+    if claims.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="admin only")
+    return claims["sub"]
