@@ -17,7 +17,7 @@ from typing import Any
 from fastapi import FastAPI
 
 from turnstile import root
-from turnstile.service import routes
+from turnstile.service import routes, sso
 from turnstile.service.registry import ConversationRegistry
 
 
@@ -45,6 +45,10 @@ def create_app(cfg: Any = None) -> FastAPI:
     # OUTSIDE the prefix — probes pin to the container, not the API contract,
     # and must not move when the API version bumps.
     app.include_router(routes.router, prefix="/v1")
+    # SSO is presence-switched (same pattern as the judge) and UNVERSIONED:
+    # the ACS URL is a contract with the IdP — it must not move with /v1.
+    if getattr(cfg, "saml", None) is not None:
+        app.include_router(sso.router)
 
     @app.get("/health")
     async def health() -> dict:

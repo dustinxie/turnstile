@@ -21,7 +21,7 @@ policy and the backend it grades with.
 A `.env` file is read when present (developer convenience; never committed).
 """
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -51,6 +51,27 @@ class KbConfig(BaseModel):
     collection: str
     expr: str
     limit: int = 10
+
+
+class SamlConfig(BaseModel):
+    """SAML SSO (FortiAuthenticator IdP): the SP we present + the IdP we
+    trust. Section absent = SSO routes not mounted. Certs/keys are PEM
+    strings (env-injected; never committed)."""
+
+    # Ourselves, the Service Provider. acs_url is SIGNED INTO assertions by
+    # the IdP — it is a contract with FAC, which is why /sso lives outside
+    # the /v1 API prefix (it must not move on an API version bump).
+    sp_entity_id: str
+    sp_acs_url: str
+    sp_sls_url: str = ""
+    sp_x509_cert: str = ""
+    sp_private_key: str = ""
+    # The IdP we trust (FAC).
+    idp_entity_id: str
+    idp_sso_url: str
+    idp_sls_url: str = ""
+    idp_x509_cert: str
+    debug: bool = False
 
 
 class JudgeConfig(BaseModel):
@@ -94,6 +115,10 @@ class Config(BaseSettings):
     # today (see its docstring), from a future SAML/FAC login route later (the
     # IdP authenticates; THIS service issues its own credential).
     jwt_secret: str | None = None
+    # The flat authorization model: usernames (comma-separated) whose
+    # SSO-minted tokens carry role=admin; everyone else is role=user.
+    # Hand-minted admin tokens pass role="admin" explicitly. Not RBAC.
+    admin_users: str = ""
 
     # Backends are siblings. The chat backend is required; the judge's is
     # optional and stands alone — grading an answer and producing it are
@@ -107,3 +132,12 @@ class Config(BaseSettings):
     # Policy only; `enabled` is the ops toggle that keeps the settings while
     # turning grading off.
     judge: JudgeConfig = JudgeConfig()
+    saml: SamlConfig | None = None  # absent = no SSO routes mounted
+
+    @model_validator(mode="after")
+    def _sso_needs_a_signing_secret(self) -> "Config":
+        # SSO's whole job is minting our JWTs — configured without the
+        # secret it could only fail at first login; fail at boot instead.
+        if self.saml is not None and not self.jwt_secret:
+            raise ValueError("saml is configured but jwt_secret is unset; SSO mints JWTs")
+        return self
