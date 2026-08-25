@@ -112,13 +112,21 @@ class Config(BaseSettings):
     # AuthN switch: the HS256 secret our JWTs are signed with (use >=32 random
     # bytes; pyjwt warns below that). Unset = auth OFF (dev mode: every request
     # is the "anonymous" principal). Tokens come from auth.mint_token — by hand
-    # today (see its docstring), from a future SAML/FAC login route later (the
-    # IdP authenticates; THIS service issues its own credential).
+    # (see its docstring) or via the SAML/FAC login route (service/sso.py: the
+    # IdP authenticates; THIS service issues its own credential). Also the key
+    # material for citation file tokens (service/files.py).
     jwt_secret: str | None = None
     # The flat authorization model: usernames (comma-separated) whose
     # SSO-minted tokens carry role=admin; everyone else is role=user.
     # Hand-minted admin tokens pass role="admin" explicitly. Not RBAC.
     admin_users: str = ""
+    # Citation file store: the documents the kb collection was indexed from,
+    # laid out as <file_root>/<region>/<filename> — the region tier exists
+    # because one deployment serves several fixed kb scopes (us/canada/...)
+    # and same-name docs must not collide. Server-side only; clients reach
+    # files exclusively through opaque tokens (GET /v1/files/{token}).
+    # Unset = the files endpoint is not mounted.
+    file_root: str | None = None
 
     # Backends are siblings. The chat backend is required; the judge's is
     # optional and stands alone — grading an answer and producing it are

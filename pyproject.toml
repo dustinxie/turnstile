@@ -5,6 +5,7 @@ description = "Chatbot service on a one-loop, two-layer agent kernel (L0/L1/L2)"
 readme = "README.md"
 requires-python = "==3.12.*"
 dependencies = [
+    "cryptography>=46.0.3",
     "fastapi>=0.141.1",
     "httpx>=0.28.1",
     # SAML SSO: the xmlsec/lxml manylinux wheels are ABI-COUPLED —

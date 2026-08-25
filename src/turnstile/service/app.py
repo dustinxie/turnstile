@@ -17,7 +17,7 @@ from typing import Any
 from fastapi import FastAPI
 
 from turnstile import root
-from turnstile.service import routes, sso
+from turnstile.service import files, routes, sso
 from turnstile.service.registry import ConversationRegistry
 
 
@@ -49,6 +49,10 @@ def create_app(cfg: Any = None) -> FastAPI:
     # the ACS URL is a contract with the IdP — it must not move with /v1.
     if getattr(cfg, "saml", None) is not None:
         app.include_router(sso.router)
+    # Citation file serving is presence-switched on the store's existence;
+    # ordinary API surface, so it lives under /v1 (unlike /sso).
+    if getattr(cfg, "file_root", None):
+        app.include_router(files.router, prefix="/v1")
 
     @app.get("/health")
     async def health() -> dict:
