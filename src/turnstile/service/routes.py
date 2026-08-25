@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
 from turnstile.kernel import events as ev
+from turnstile.kernel.dtos import Role
 from turnstile.service.auth import require_user
 from turnstile.service.envelope import build_envelope
 from turnstile.service.files import mint_file_token
@@ -191,6 +192,38 @@ async def cancel_turn(
         return JSONResponse({"status": "idle"})  # nothing running; not an error
     await entry.handle.commands.put(ev.Cancel())
     return JSONResponse({"status": "cancelling"}, status_code=202)
+
+
+_TITLE_CHARS = 60
+
+
+@router.get("/conversations")
+async def list_conversations(request: Request, principal: str = Depends(require_user)):
+    """The history panel's surface: the principal's conversations, newest
+    claim first. Ownership is the ONLY filter — foreign ids are simply not
+    in the list (the same no-existence-leak rule as the 404s). `title` is a
+    display convenience: the first user message, truncated; a conversation
+    whose first turn is still running has no snapshot yet and lists as
+    untitled with in_flight=true."""
+    store = request.app.state.store
+    registry = request.app.state.registry
+    items = []
+    for conversation_id in reversed(store.owned_by(principal)):
+        snapshot = store.load(conversation_id)
+        entry = registry.get(conversation_id)
+        first_user = next(
+            (m.text for m in (snapshot.messages if snapshot else []) if m.role is Role.USER),
+            "",
+        )
+        items.append(
+            {
+                "conversation_id": conversation_id,
+                "title": first_user[:_TITLE_CHARS],
+                "turn_counter": snapshot.turn_counter if snapshot else 0,
+                "in_flight": bool(entry and entry.in_flight),
+            }
+        )
+    return {"conversations": items}
 
 
 @router.get("/conversations/{conversation_id}")

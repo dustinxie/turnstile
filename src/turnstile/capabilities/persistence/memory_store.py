@@ -43,6 +43,11 @@ class MemorySessionStore:
     def owner(self, session_id: str) -> str | None:
         return self._owners.get(session_id)
 
+    def owned_by(self, owner: str) -> list[str]:
+        """The principal's sessions, oldest claim first (dict order). The
+        listing surface reads this — foreign ids never leave the store."""
+        return [sid for sid, who in self._owners.items() if who == owner]
+
     def load(self, session_id: str) -> SessionSnapshot | None:
         """The resume path: the latest snapshot, or None for a new/expired
         session (the caller starts fresh — never reconstructs from elsewhere)."""
