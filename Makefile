@@ -1,8 +1,8 @@
 # Local gate — run before every commit. CI (host TBD) will invoke `make check`.
 
-.PHONY: check sync lint format types contracts test test-all image
+.PHONY: check sync lint format types contracts test test-all image frontend-check
 
-check: sync lint format types contracts test
+check: sync lint format types contracts test frontend-check
 
 sync:
 	uv sync --frozen
@@ -33,3 +33,9 @@ image:
 	docker build -t turnstile:$(TAG) \
 		--build-arg GIT_COMMIT=$$(git rev-parse HEAD) \
 		--build-arg DOCKER_TAG=$(TAG) .
+
+# The frontend half of the gate (typecheck, lint, vitest, build). Part of
+# `make check` so one command guards every commit; installs deps on first run.
+frontend-check:
+	test -d frontend/node_modules || (cd frontend && npm install)
+	cd frontend && npm run check
