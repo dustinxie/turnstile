@@ -5,19 +5,24 @@ the credential (auth.mint_token — the one minting path). The browser flow:
 
     GET  /sso           -> 302 to the IdP's login page
     POST /sso/acs       <- the IdP posts the signed SAMLResponse here;
-                           we validate it and answer {"token": <JWT>}
+                           we validate it and 302 to the frontend with
+                           "#token=<JWT>" in the URL fragment
     GET  /sso/metadata  -> our SP metadata XML (pasted into FAC once)
 
 Routes are mounted UNVERSIONED (not under /v1) and only when `saml` is
 configured: the ACS URL is signed into FAC's assertions — a contract with
 the IdP that must not move on an API version bump (same logic as /health).
 
-The token comes back as JSON for now (no frontend exists; curl-era honest).
-When the frontend lands, this becomes a redirect with a #token= fragment —
-one line here, zero protocol change.
+The token travels in the URL FRAGMENT of the final redirect: fragments are
+never sent to servers (no access logs, no Referer leaks) — only the page's
+JS reads it, stores it, and strips it from the address bar. `GET /sso?next=`
+carries the page to return to through SAML RelayState (same-origin paths
+only — an absolute URL there would be an open redirect).
 
-AuthZ at login is deliberately thin: any @fortinet.com identity gets a
-user token; usernames in `admin_users` get role=admin (the flat model,
+AuthZ at login is deliberately thin: the IdP decided who may log in, so any
+asserted username gets a user token (no email check — FAC's email attribute
+may be blank or not an address; the reference assistant trusts the username
+the same way); usernames in `admin_users` get role=admin (the flat model,
 auth.require_admin). No user table, no auto-provisioning — that can ride
 the M7 sessions table if ever needed.
 """
@@ -29,6 +34,7 @@ from urllib.parse import urlparse
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import RedirectResponse
 from onelogin.saml2.auth import OneLogin_Saml2_Auth
+from starlette.datastructures import FormData
 
 from turnstile.service.auth import mint_token
 
@@ -96,23 +102,34 @@ def init_saml_auth(req: dict, saml: Any) -> OneLogin_Saml2_Auth:
     return OneLogin_Saml2_Auth(req, old_settings=_settings(saml))
 
 
+def _safe_next(value: str | None) -> str | None:
+    """A same-origin path to return to, or None. Rejects absolute URLs and
+    protocol-relative "//host" — RelayState is attacker-writable."""
+    if value and value.startswith("/") and not value.startswith("//"):
+        return value
+    return None
+
+
 @router.get("/sso")
-async def initiate_sso(request: Request) -> RedirectResponse:
-    """Kick off login: 302 to the IdP with a signed AuthnRequest."""
+async def initiate_sso(request: Request, next: str | None = None) -> RedirectResponse:
+    """Kick off login: 302 to the IdP with a signed AuthnRequest. `next` (a
+    same-origin path) rides RelayState and comes back on the ACS."""
     auth = init_saml_auth(_prepare_request(request), request.app.state.cfg.saml)
-    return RedirectResponse(url=auth.login(), status_code=302)
+    return RedirectResponse(url=auth.login(return_to=_safe_next(next)), status_code=302)
 
 
 @router.post("/sso/acs")
-async def sso_acs(request: Request) -> dict:
-    """Assertion Consumer Service: validate the IdP's SAMLResponse, then
-    mint OUR credential. Every failure is one generic 401 — the ACS must
-    not be an oracle for what part of a forged assertion was wrong."""
+async def sso_acs(request: Request) -> RedirectResponse:
+    """Assertion Consumer Service: validate the IdP's SAMLResponse, mint OUR
+    credential, and hand it to the frontend as a URL fragment. Every failure
+    is one generic 401 — the ACS must not be an oracle for what part of a
+    forged assertion was wrong."""
     cfg: Any = request.app.state.cfg
     req = _prepare_request(request)
     # SAML POST binding sends SAMLResponse/RelayState single-valued;
     # dict() takes first-occurrence via Starlette's FormData.
-    req["post_data"] = dict(await request.form())
+    form: FormData = await request.form()
+    req["post_data"] = dict(form)
 
     auth = init_saml_auth(req, cfg.saml)
     auth.process_response()
@@ -124,14 +141,16 @@ async def sso_acs(request: Request) -> dict:
 
     attributes = auth.get_attributes()  # may carry PII — never log above DEBUG
     username = _first(attributes, "username", "Username").lower()
-    email = _first(attributes, "email", "Email").lower()
-    if not username or not email.endswith("@fortinet.com"):
-        logger.warning("SAML assertion lacked a fortinet identity (user=%r)", username)
+    if not username:
+        logger.warning("SAML assertion carried no username (attributes=%s)", sorted(attributes))
         raise HTTPException(status_code=401, detail="sso failed")
 
     admins = {u.strip() for u in cfg.admin_users.split(",") if u.strip()}
     role = "admin" if username in admins else "user"
-    return {"token": mint_token(cfg.jwt_secret, username, role=role)}
+    token = mint_token(cfg.jwt_secret, username, role=role)
+    relay = form.get("RelayState")
+    target = _safe_next(relay if isinstance(relay, str) else None) or cfg.saml.return_url
+    return RedirectResponse(url=f"{target}#token={token}", status_code=302)
 
 
 @router.get("/sso/metadata")

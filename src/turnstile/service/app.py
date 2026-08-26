@@ -66,6 +66,10 @@ def create_app(cfg: Any = None) -> FastAPI:
             "spec": cfg.spec_id,
             "commit": os.environ.get("GIT_COMMIT", "unknown"),
             "docker_tag": os.environ.get("DOCKER_TAG", "unknown"),
+            # what the frontend needs to shape its login UI: is a token
+            # required at all, and is there an SSO route to send people to
+            "auth": bool(getattr(cfg, "jwt_secret", None)),
+            "sso": getattr(cfg, "saml", None) is not None,
         }
 
     return app

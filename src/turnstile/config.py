@@ -72,6 +72,10 @@ class SamlConfig(BaseModel):
     idp_sls_url: str = ""
     idp_x509_cert: str
     debug: bool = False
+    # Where the browser lands after a successful login: the frontend origin
+    # (+ optional path). The token rides the URL FRAGMENT ("#token=..."):
+    # fragments never reach servers or logs, only the page's own JS.
+    return_url: str = "/"
 
 
 class JudgeConfig(BaseModel):

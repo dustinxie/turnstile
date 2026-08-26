@@ -1,7 +1,7 @@
 """SSO login — the SAML seam is stubbed (init_saml_auth); everything above
 it runs for real: presence-switch mounting, ACS validation outcomes, the
-fortinet-identity gate, role assignment from admin_users, and that the
-minted JWT actually passes require_user/require_admin."""
+username-is-the-identity rule, role assignment from admin_users, and that
+the minted JWT actually passes require_user/require_admin."""
 
 import httpx
 import jwt as pyjwt
@@ -66,7 +66,8 @@ class _StubAuth:
     def get_attributes(self) -> dict:
         return self._attributes
 
-    def login(self) -> str:
+    def login(self, return_to=None) -> str:
+        self.return_to = return_to
         return "https://fac.example/idp/sso?SAMLRequest=stub"
 
 
@@ -74,8 +75,16 @@ def _stub_seam(monkeypatch, **stub_kwargs) -> None:
     monkeypatch.setattr(sso, "init_saml_auth", lambda req, saml: _StubAuth(**stub_kwargs))
 
 
-async def _acs(client) -> httpx.Response:
-    return await client.post("/sso/acs", data={"SAMLResponse": "stub", "RelayState": "/"})
+async def _acs(client, relay: str = "/") -> httpx.Response:
+    return await client.post("/sso/acs", data={"SAMLResponse": "stub", "RelayState": relay})
+
+
+def _token_from(response: httpx.Response) -> str:
+    """The ACS hands the token over as a URL fragment on a 302."""
+    assert response.status_code == 302, (response.status_code, response.text)
+    location = response.headers["location"]
+    assert "#token=" in location, location
+    return location.split("#token=", 1)[1]
 
 
 # ── mounting ───────────────────────────────────────────────────────────
@@ -114,8 +123,8 @@ async def test_acs_mints_a_working_user_token(monkeypatch):
     app = create_app(_cfg())
     async with _client(app) as client:
         response = await _acs(client)
-        assert response.status_code == 200
-        token = response.json()["token"]
+        token = _token_from(response)
+        assert response.headers["location"].startswith("/#token=")  # default return_url
 
         claims = pyjwt.decode(token, SECRET, algorithms=["HS256"])
         assert claims["sub"] == "alice"  # lowercased
@@ -135,7 +144,7 @@ async def test_admin_users_mints_the_admin_role(monkeypatch):
     )
     app = create_app(_cfg(admin_users="boss, other.admin"))
     async with _client(app) as client:
-        token = (await _acs(client)).json()["token"]
+        token = _token_from(await _acs(client))
     assert pyjwt.decode(token, SECRET, algorithms=["HS256"])["role"] == "admin"
 
 
@@ -145,8 +154,8 @@ async def test_acs_failures_are_one_generic_401(monkeypatch):
         {"errors": ["invalid_response"]},  # signature/Destination/expiry failed
         {"authenticated": False},  # processed but not authenticated
         {"attributes": {}},  # no identity attributes at all
-        {"attributes": {"username": ["eve"], "email": ["eve@evil.example"]}},  # foreign domain
-        {"attributes": {"email": ["ghost@fortinet.com"]}},  # email but no username
+        {"attributes": {"email": ["ghost@fortinet.com"]}},  # email but no username: the
+        # username IS the identity; email is not consulted
     ]
     for stub_kwargs in cases:
         _stub_seam(monkeypatch, **stub_kwargs)
@@ -168,3 +177,36 @@ async def test_metadata_serves_sp_xml():
     body = response.text
     assert "https://bot.example/sso/metadata" in body  # our entityId
     assert "https://bot.example/sso/acs" in body  # the ACS contract
+
+
+# ── where the browser lands ────────────────────────────────────────────
+
+
+async def test_return_path_rides_relay_state_and_rejects_open_redirects(monkeypatch):
+    _stub_seam(monkeypatch, attributes={"username": ["alice"], "email": ["alice@fortinet.com"]})
+    app = create_app(_cfg(saml={**_SAML, "return_url": "https://chat.example/app"}))
+    async with _client(app) as client:
+        # a same-origin next path wins over the configured landing page
+        location = (await _acs(client, relay="/chat/c1")).headers["location"]
+        assert location.startswith("/chat/c1#token=")
+        # anything not a same-origin path falls back to return_url — RelayState
+        # is attacker-writable; an absolute URL there would be an open redirect
+        for bad in ["https://evil.example/", "//evil.example", "javascript:alert(1)", ""]:
+            location = (await _acs(client, relay=bad)).headers["location"]
+            assert location.startswith("https://chat.example/app#token="), bad
+
+
+async def test_initiate_forwards_next_as_relay_state(monkeypatch):
+    seen: list[_StubAuth] = []
+
+    def seam(req, saml):
+        stub = _StubAuth()
+        seen.append(stub)
+        return stub
+
+    monkeypatch.setattr(sso, "init_saml_auth", seam)
+    app = create_app(_cfg())
+    async with _client(app) as client:
+        await client.get("/sso", params={"next": "/chat/c1"}, follow_redirects=False)
+        await client.get("/sso", params={"next": "https://evil.example"}, follow_redirects=False)
+    assert [s.return_to for s in seen] == ["/chat/c1", None]

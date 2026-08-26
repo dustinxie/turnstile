@@ -38,6 +38,8 @@ async def test_health_reports_ok_and_the_served_spec():
         "spec": "support_bot",
         "commit": "unknown",
         "docker_tag": "unknown",
+        "auth": False,  # no jwt_secret -> dev mode
+        "sso": False,  # no saml section -> no login route
     }
 
 
