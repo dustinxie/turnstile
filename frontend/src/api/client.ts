@@ -5,7 +5,7 @@
  * endpoint is a POST — native EventSource can neither POST nor set headers.
  */
 import { createParser, type EventSourceMessage } from 'eventsource-parser'
-import type { ConversationView, Envelope, TurnEvent } from './types'
+import type { ConversationSummary, ConversationView, Envelope, TurnEvent } from './types'
 
 export const TOKEN_KEY = 'turnstile.token'
 
@@ -109,4 +109,10 @@ export async function getConversation(conversationId: string): Promise<Conversat
   })
   if (response.status === 404) return null
   return (await ok(response)).json() as Promise<ConversationView>
+}
+
+/** The principal's conversations, newest first (ownership is the only filter). */
+export async function listConversations(): Promise<ConversationSummary[]> {
+  const response = await ok(await fetch('/v1/conversations', { headers: headers() }))
+  return ((await response.json()) as { conversations: ConversationSummary[] }).conversations
 }

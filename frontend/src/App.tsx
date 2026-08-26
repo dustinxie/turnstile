@@ -1,29 +1,43 @@
 /**
- * The one screen: a history panel on the left, the conversation on the right.
- * F2: the chat window is live against a fresh conversation id per page load
- * (the client picks the id; the first POST claims it). F4 fills the panel.
+ * The one screen: the history panel on the left, the conversation on the
+ * right. The client picks conversation ids (uuid); the first POST claims one,
+ * and the panel refreshes when a turn settles so the new chat appears titled.
  */
-import { useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { ChatWindow } from './chat/ChatWindow'
 import { useConversation } from './chat/useConversation'
+import { HistoryPanel } from './history/HistoryPanel'
+import { useConversationList } from './history/useConversationList'
 
 export default function App() {
-  const [conversationId] = useState(() => crypto.randomUUID())
-  const { state, send, stop } = useConversation(conversationId)
+  const [initialId] = useState(() => crypto.randomUUID())
+  const { state, send, stop, load, start } = useConversation(initialId)
+  const { items, error, refresh } = useConversationList()
+
+  // a turn just settled -> the list may have a new entry / new title
+  const wasStreaming = useRef(false)
+  useEffect(() => {
+    if (wasStreaming.current && state.status === 'idle') void refresh()
+    wasStreaming.current = state.status === 'streaming'
+  }, [state.status, refresh])
+
+  const onSelect = useCallback(
+    (id: string) => {
+      if (id !== state.conversationId) void load(id)
+    },
+    [load, state.conversationId],
+  )
+  const onNew = useCallback(() => start(crypto.randomUUID()), [start])
 
   return (
     <div className="flex h-full bg-neutral-50 text-neutral-900">
-      <aside
-        aria-label="conversation history"
-        className="flex w-64 shrink-0 flex-col border-r border-neutral-200 bg-white"
-      >
-        <div className="border-b border-neutral-200 px-4 py-3 text-sm font-semibold">
-          turnstile
-        </div>
-        <div className="flex-1 overflow-y-auto p-2 text-sm text-neutral-500">
-          No conversations yet.
-        </div>
-      </aside>
+      <HistoryPanel
+        items={items}
+        activeId={state.conversationId}
+        error={error}
+        onSelect={onSelect}
+        onNew={onNew}
+      />
       <main aria-label="conversation" className="flex min-w-0 flex-1 flex-col">
         <ChatWindow state={state} onSend={send} onStop={stop} />
       </main>

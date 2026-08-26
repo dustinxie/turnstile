@@ -158,6 +158,12 @@ export function useConversation(conversationId: string) {
     }
   }, [state.conversationId])
 
+  /** Switch to a brand-new conversation: nothing to fetch, the first POST claims it. */
+  const start = useCallback((id: string) => {
+    abort.current?.abort()
+    dispatch({ type: 'reset', conversationId: id })
+  }, [])
+
   const load = useCallback(async (id: string) => {
     abort.current?.abort()
     const view = await getConversation(id)
@@ -167,5 +173,5 @@ export function useConversation(conversationId: string) {
     dispatch({ type: 'reset', conversationId: id, messages })
   }, [])
 
-  return { state, send, stop, load }
+  return { state, send, stop, load, start }
 }

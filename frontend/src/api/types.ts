@@ -37,6 +37,13 @@ export type TurnEvent =
   | { event: 'envelope'; envelope: Envelope }
   | { event: 'other'; name: string }
 
+export interface ConversationSummary {
+  conversation_id: string
+  title: string // first user message, truncated server-side; '' while the first turn runs
+  turn_counter: number
+  in_flight: boolean
+}
+
 export interface ConversationView {
   conversation_id: string
   turn_counter: number

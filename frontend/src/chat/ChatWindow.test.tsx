@@ -4,7 +4,9 @@ import { setupServer } from 'msw/node'
 import App from '../App'
 import { envelope, http, HttpResponse, sseResponse } from '../test/sse'
 
-const server = setupServer()
+const server = setupServer(
+  http.get('/v1/conversations', () => HttpResponse.json({ conversations: [] })),
+)
 beforeAll(() => server.listen({ onUnhandledRequest: 'error' }))
 afterEach(() => server.resetHandlers())
 afterAll(() => server.close())
