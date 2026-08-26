@@ -7,9 +7,20 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { ChatWindow } from './chat/ChatWindow'
 import { useConversation } from './chat/useConversation'
 import { HistoryPanel } from './history/HistoryPanel'
+import { LoginScreen } from './history/LoginScreen'
+import { useAuth } from './history/useAuth'
 import { useConversationList } from './history/useConversationList'
 
 export default function App() {
+  const auth = useAuth()
+  // wait for /health: no authenticated call may fire before we know whether
+  // a token is required (a premature 401 would bounce to login)
+  if (!auth.ready) return null
+  if (auth.mustLogin) return <LoginScreen onLogin={auth.login} />
+  return <Workspace auth={auth} />
+}
+
+function Workspace({ auth }: { auth: ReturnType<typeof useAuth> }) {
   const [initialId] = useState(() => crypto.randomUUID())
   const { state, send, stop, load, start } = useConversation(initialId)
   const { items, error, refresh } = useConversationList()
@@ -37,6 +48,10 @@ export default function App() {
         error={error}
         onSelect={onSelect}
         onNew={onNew}
+        principal={auth.principal}
+        canLogin={auth.canLogin}
+        onLogin={auth.login}
+        onLogout={auth.logout}
       />
       <main aria-label="conversation" className="flex min-w-0 flex-1 flex-col">
         <ChatWindow state={state} onSend={send} onStop={stop} />

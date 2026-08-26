@@ -10,9 +10,24 @@ interface Props {
   error: string | null
   onSelect: (id: string) => void
   onNew: () => void
+  /** login state: who is signed in (null = nobody / dev mode) */
+  principal: { sub: string } | null
+  canLogin: boolean // the deployment has an SSO route and nobody is signed in
+  onLogin: () => void
+  onLogout: () => void
 }
 
-export function HistoryPanel({ items, activeId, error, onSelect, onNew }: Props) {
+export function HistoryPanel({
+  items,
+  activeId,
+  error,
+  onSelect,
+  onNew,
+  principal,
+  canLogin,
+  onLogin,
+  onLogout,
+}: Props) {
   return (
     <aside
       aria-label="conversation history"
@@ -60,6 +75,27 @@ export function HistoryPanel({ items, activeId, error, onSelect, onNew }: Props)
           })}
         </ul>
       </nav>
+      <div
+        aria-label="account"
+        className="flex items-center justify-between border-t border-neutral-200 px-4 py-2 text-xs"
+      >
+        {principal ? (
+          <>
+            <span className="truncate text-neutral-700" title={principal.sub}>
+              {principal.sub}
+            </span>
+            <button type="button" onClick={onLogout} className="text-neutral-500 hover:underline">
+              Log out
+            </button>
+          </>
+        ) : canLogin ? (
+          <button type="button" onClick={onLogin} className="text-blue-600 hover:underline">
+            Log in
+          </button>
+        ) : (
+          <span className="text-neutral-400">anonymous</span>
+        )}
+      </div>
     </aside>
   )
 }

@@ -5,6 +5,7 @@ import App from '../App'
 import { envelope, http, HttpResponse, sseResponse } from '../test/sse'
 
 const server = setupServer(
+  http.get('/health', () => HttpResponse.json({ status: 'ok', spec: 's', auth: false, sso: false })),
   http.get('/v1/conversations', () => HttpResponse.json({ conversations: [] })),
 )
 beforeAll(() => server.listen({ onUnhandledRequest: 'error' }))
@@ -15,7 +16,8 @@ const MESSAGES = '/v1/conversations/:id/messages'
 
 async function ask(text: string) {
   const user = userEvent.setup()
-  await user.type(screen.getByLabelText('message'), text)
+  // the workspace mounts once /health has answered
+  await user.type(await screen.findByLabelText('message'), text)
   await user.keyboard('{Enter}')
   return user
 }
@@ -145,7 +147,7 @@ test('sending mid-turn steers (202) instead of opening a second stream', async (
 })
 
 test('an HTTP failure surfaces as a notice and frees the composer', async () => {
-  server.use(http.post(MESSAGES, () => HttpResponse.text('nope', { status: 401 })))
+  server.use(http.post(MESSAGES, () => HttpResponse.text('boom', { status: 500 })))
   render(<App />)
   await ask('q')
   await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('Error'))

@@ -31,8 +31,24 @@ export class ApiError extends Error {
 }
 
 async function ok(response: Response): Promise<Response> {
+  if (response.status === 401) {
+    // token missing/expired: the only recovery is logging in again
+    const { onUnauthorized } = await import('./auth')
+    onUnauthorized()
+  }
   if (!response.ok) throw new ApiError(response.status, await response.text())
   return response
+}
+
+export interface Health {
+  status: string
+  spec: string
+  auth: boolean // a token is required (jwt_secret set)
+  sso: boolean // GET /sso exists (saml configured)
+}
+
+export async function getHealth(): Promise<Health> {
+  return (await ok(await fetch('/health'))).json() as Promise<Health>
 }
 
 /** Decode one SSE frame into a TurnEvent (unknown names -> `other`). */

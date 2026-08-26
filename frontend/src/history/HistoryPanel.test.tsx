@@ -23,6 +23,7 @@ const VIEWS: Record<string, unknown> = {
 }
 
 const server = setupServer(
+  http.get('/health', () => HttpResponse.json({ status: 'ok', spec: 's', auth: false, sso: false })),
   http.get('/v1/conversations', () => HttpResponse.json({ conversations: LIST })),
   http.get('/v1/conversations/:id', ({ params }) => {
     const view = VIEWS[params.id as string]
