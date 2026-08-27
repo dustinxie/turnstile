@@ -39,7 +39,7 @@ def create_app(cfg: Any = None) -> FastAPI:
     # (root.build_store's contract); the registry maps conversation ids onto
     # running agents assembled from cfg + that store.
     app.state.cfg = cfg
-    app.state.store = root.build_store()
+    app.state.store = root.build_store(getattr(cfg, "redis", None))
     app.state.registry = ConversationRegistry(cfg, app.state.store)
     # API is versioned (/v1/conversations/...); /health is deliberately
     # OUTSIDE the prefix — probes pin to the container, not the API contract,

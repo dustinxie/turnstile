@@ -14,13 +14,35 @@ services:
     container_name: api.hrassist.docker
     image: turnstile:${TURNSTILE_TAG:-latest}
     restart: always
+    depends_on:
+      - hrassist_redis
     env_file:
       - .env                      # LLM__*, KB__*, JUDGE_LLM__*, JWT_SECRET, SAML__*, FILE_ROOT
     environment:
       - TZ=America/Los_Angeles
+      # the session store. Retention = REDIS__TTL_SECONDS (default 30 days;
+      # 0 = never); SESSION_TTL_SECONDS is only in-memory idle eviction.
+      - REDIS__URL=redis://redis.hrassist.docker:6379/0
     volumes:
       # citation documents: <FILE_ROOT>/<region>/<path>; read-only
       - ${FILE_ROOT_HOST:-/data/carevu_files}:${FILE_ROOT:-/data/carevu_files}:ro
+    networks:
+      - webservice
+    logging:
+      driver: json-file
+      options:
+        max-size: 50m
+
+  hrassist_redis:
+    # the session store: conversations outlive API restarts. Durability across
+    # Redis restarts via AOF on a named volume; noeviction so memory pressure
+    # can never silently drop ACTIVE sessions (architecture §4)
+    container_name: redis.hrassist.docker
+    image: redis:7-alpine
+    restart: always
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - hrassist_redis_data:/data
     networks:
       - webservice
     logging:
@@ -47,6 +69,9 @@ services:
       driver: json-file
       options:
         max-size: 50m
+
+volumes:
+  hrassist_redis_data:
 
 networks:
   webservice:

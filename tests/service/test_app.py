@@ -50,6 +50,6 @@ async def test_injected_cfg_is_used_verbatim():
 
 async def test_each_app_owns_one_process_wide_store():
     app = create_app(_cfg())
-    assert type(app.state.store) is type(build_store())
+    assert type(app.state.store) is type(build_store())  # no redis section -> memory store
     assert app.state.store is app.state.store  # stable attribute, built once
     assert create_app(_cfg()).state.store is not app.state.store  # per app, not global

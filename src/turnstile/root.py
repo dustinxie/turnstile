@@ -16,9 +16,10 @@ no adapter ever names a config type).
 from dataclasses import dataclass
 
 from turnstile.capabilities.persistence.memory_store import MemorySessionStore
+from turnstile.capabilities.persistence.redis_store import RedisSessionStore
 from turnstile.capabilities.providers.openai_compat import OpenAICompatProvider
 from turnstile.capabilities.tools import RECIPES
-from turnstile.config import Config
+from turnstile.config import Config, RedisConfig
 from turnstile.kernel.engine import Agent
 from turnstile.kernel.ports import LifecycleHooks, Tool, ToolMiddleware
 from turnstile.products.hooks.quality_judge import QualityJudgeHook
@@ -29,6 +30,10 @@ from turnstile.products.middleware.references import ReferenceCollector
 # this file.
 from turnstile.products.spec import AgentSpec
 from turnstile.products.specs import SPECS
+
+# The store the driver holds: Redis when configured, else the in-memory
+# stand-in — same surface (architecture §4), chosen once in build_store().
+SessionStore = MemorySessionStore | RedisSessionStore
 
 
 @dataclass(frozen=True)
@@ -41,7 +46,7 @@ class AssembledAgent:
 
     agent: Agent
     references: ReferenceCollector
-    store: MemorySessionStore
+    store: SessionStore
     judge: QualityJudgeHook | None = None
 
 
@@ -52,16 +57,25 @@ def load_config() -> Config:
     return Config()  # type: ignore[call-arg] — fields come from the env
 
 
-def build_store() -> MemorySessionStore:
+def build_store(redis: RedisConfig | None = None) -> SessionStore:
     """The snapshot store outlives any one conversation, so a driver builds
-    it once and passes it into every assemble() (M4's registry does this)."""
+    it once and passes it into every assemble() (M4's registry does this).
+    Redis when its section is configured (conversations outlive the process;
+    retention is redis.ttl_seconds), else the in-memory stand-in. The section
+    mirrors the constructor field-for-field (splat + parity test, like llm/kb).
+    Reachability is checked here so a bad REDIS__URL fails at boot, not on the
+    first turn."""
+    if redis is not None:
+        store = RedisSessionStore(**redis.model_dump())
+        store.ping()
+        return store
     return MemorySessionStore()
 
 
 def assemble(
     cfg: Config,
     session_id: str = "default",
-    store: MemorySessionStore | None = None,
+    store: SessionStore | None = None,
 ) -> AssembledAgent:
     """Build one conversation's agent. Resumes from `store` when it holds a
     snapshot for `session_id`; otherwise starts fresh."""

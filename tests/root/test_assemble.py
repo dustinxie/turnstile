@@ -4,10 +4,11 @@ import inspect
 
 import pytest
 
+from turnstile.capabilities.persistence.redis_store import RedisSessionStore
 from turnstile.capabilities.providers.openai_compat import OpenAICompatProvider
 from turnstile.capabilities.tools.kb_search import KbSearchTool
 from turnstile.capabilities.tools.web_search import WebSearchTool
-from turnstile.config import Config
+from turnstile.config import Config, RedisConfig
 from turnstile.kernel.dtos import Message, SessionSnapshot
 from turnstile.products.hooks.quality_judge import QualityJudgeHook
 from turnstile.products.middleware.references import ReferenceCollector
@@ -47,6 +48,7 @@ def _cfg(**overrides) -> Config:
     [
         pytest.param(type(_cfg().llm), OpenAICompatProvider, id="llm->provider"),
         pytest.param(type(_cfg().kb), KbSearchTool, id="kb->kb_search"),
+        pytest.param(RedisConfig, RedisSessionStore, id="redis->redis_store"),
     ],
 )
 def test_splatted_sections_mirror_their_constructors(section_type, constructor):

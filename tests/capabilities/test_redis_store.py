@@ -184,3 +184,26 @@ async def test_hook_and_checkpoint_write_the_sessions_slot(redis_url):
     await resumed.run_to_completion("q2")
     snap2 = store.load("s")
     assert snap2 is not None and snap2.turn_counter == 2
+
+
+def test_root_wires_retention_from_the_redis_section_not_eviction(redis_url):
+    # redis.ttl_seconds = retention (resume window); session_ttl_seconds only
+    # evicts the live agent from memory — two knobs, deliberately separate
+    from turnstile.config import Config
+    from turnstile.root import build_store
+
+    cfg = Config(
+        _env_file=None,  # type: ignore[call-arg]
+        session_ttl_seconds=60,
+        redis={"url": redis_url, "ttl_seconds": 86400 * 30, "prefix": "t6"},
+        llm={"base_url": "https://ds4.example/v1", "model": "model-fast"},
+        kb={
+            "embedding_url": "https://e/x",
+            "milvus_url": "https://m/x",
+            "collection": "c",
+            "expr": "e",
+        },
+    )
+    store = build_store(cfg.redis)  # the store needs only its own section
+    assert isinstance(store, RedisSessionStore)
+    assert store._ttl == 86400 * 30  # retention, not the 60s eviction knob

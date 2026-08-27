@@ -78,6 +78,21 @@ class SamlConfig(BaseModel):
     return_url: str = "/"
 
 
+class RedisConfig(BaseModel):
+    """The session store (architecture §4): snapshots + ownership live in
+    Redis so conversations outlive the process. Section absent = the
+    in-memory store (dev; everything dies with the process). The resume
+    window is `session_ttl_seconds` (top level) — one TTL for eviction and
+    expiry alike."""
+
+    url: str  # redis://[:password@]host:port/db
+    prefix: str = "turnstile"  # key namespace; several deployments may share one Redis
+    # RETENTION: how long a conversation stays resumable/listed after its last
+    # turn (the resume window, §4). Distinct from session_ttl_seconds, which
+    # only evicts the live agent from process memory. 0 = never expire.
+    ttl_seconds: int = 30 * 24 * 3600
+
+
 class JudgeConfig(BaseModel):
     """Quality-judge POLICY — when to retry, how strict. The backend it grades
     with is a separate section (`judge_llm`)."""
@@ -145,6 +160,7 @@ class Config(BaseSettings):
     # turning grading off.
     judge: JudgeConfig = JudgeConfig()
     saml: SamlConfig | None = None  # absent = no SSO routes mounted
+    redis: RedisConfig | None = None  # absent = in-memory session store (dev)
 
     @model_validator(mode="after")
     def _sso_needs_a_signing_secret(self) -> "Config":
