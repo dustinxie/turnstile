@@ -1,0 +1,54 @@
+# turnstile backend beside the existing aa stack, on the same nginx host.
+#
+#   docker compose -f docker-compose.hrassist.yml --env-file .env up -d
+#
+# Two containers: the API (api.hrassist.docker) and the frontend
+# (web.hrassist.docker = nginx serving the built SPA; its nginx conf + certs
+# are the host's, mounted at /etc/nginx). Both join the host's existing
+# `webservice` network so nginx reaches the API by container name.
+# Images: `make image TAG=<tag>` / `make image-frontend TAG=<tag>`, pushed to
+# the registry and pulled here.
+
+services:
+  hrassist_api:
+    container_name: api.hrassist.docker
+    image: turnstile:${TURNSTILE_TAG:-latest}
+    restart: always
+    env_file:
+      - .env                      # LLM__*, KB__*, JUDGE_LLM__*, JWT_SECRET, SAML__*, FILE_ROOT
+    environment:
+      - TZ=America/Los_Angeles
+    volumes:
+      # citation documents: <FILE_ROOT>/<region>/<path>; read-only
+      - ${FILE_ROOT_HOST:-/data/carevu_files}:${FILE_ROOT:-/data/carevu_files}:ro
+    networks:
+      - webservice
+    logging:
+      driver: json-file
+      options:
+        max-size: 50m
+
+  hrassist_web:
+    container_name: web.hrassist.docker
+    image: turnstile-frontend:${TURNSTILE_TAG:-latest}
+    restart: always
+    depends_on:
+      - hrassist_api
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      # the host owns nginx's configuration and TLS material; the image only
+      # carries the built SPA at /usr/share/nginx/html/dist
+      - ${NGINX_CONF_HOST:-./conf}:/etc/nginx
+    networks:
+      - webservice
+    logging:
+      driver: json-file
+      options:
+        max-size: 50m
+
+networks:
+  webservice:
+    external: true                # aa's compose owns it; check the real name with
+    # name: <project>_webservice  #   `docker network ls | grep webservice` and set it here

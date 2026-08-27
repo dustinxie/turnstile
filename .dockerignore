@@ -8,5 +8,6 @@ __pycache__
 *.pyc
 tests
 docs
-frontend/node_modules
-frontend/dist
+deploy
+# the SPA is its own image, built from its own context (docker build frontend/)
+frontend
