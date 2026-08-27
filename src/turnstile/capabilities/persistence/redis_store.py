@@ -10,6 +10,8 @@ Layout (one prefix, so several deployments may share a Redis):
   {prefix}:snap:{session_id}   -> snapshot JSON (snapshot_codec), keep-latest
   {prefix}:owner:{session_id}  -> principal
   {prefix}:owned:{principal}   -> SET of session ids (the listing surface)
+  {prefix}:turnmeta:{session_id} -> HASH turn -> JSON sidecar (signal, score,
+                                  references) written by the driver
 Snapshot and owner carry the SAME TTL — the resume window (§4): a session
 that ages out is gone as a unit; 0 = no expiry. The owned-set entry for an
 expired session is dropped lazily when the listing finds no snapshot.
@@ -19,6 +21,8 @@ registry, root) is a sub-millisecond local round trip and the store's
 surface is synchronous today; going async is a surface change for later.
 Durability across Redis restarts is Redis's job (RDB/AOF, see deploy/).
 """
+
+import json
 
 import redis
 
@@ -48,6 +52,9 @@ class RedisSessionStore:
     def _owned(self, principal: str) -> str:
         return f"{self._prefix}:owned:{principal}"
 
+    def _turnmeta(self, sid: str) -> str:
+        return f"{self._prefix}:turnmeta:{sid}"
+
     def _get(self, key: str) -> str | None:
         # decode_responses=True makes these str at runtime; the client's typing
         # still says bytes | str, so coerce once here
@@ -66,6 +73,18 @@ class RedisSessionStore:
         if self._ttl > 0:  # the owner ages with its newest snapshot
             self._r.expire(self._owner(session_id), self._ttl)
 
+    def save_turn_meta(self, session_id: str, turn: int, meta: dict) -> None:
+        """The driver's per-turn sidecar (signal, score, references) — L2
+        collector output kept OUT of the kernel snapshot, same TTL."""
+        key = self._turnmeta(session_id)
+        self._r.hset(key, str(turn), json.dumps(meta, ensure_ascii=False))
+        if self._ttl > 0:
+            self._r.expire(key, self._ttl)
+
+    def load_turn_meta(self, session_id: str) -> dict[int, dict]:
+        raw = self._r.hgetall(self._turnmeta(session_id))
+        return {int(str(k)): json.loads(str(v)) for k, v in raw.items()}
+
     def load(self, session_id: str) -> SessionSnapshot | None:
         """The resume path: the latest snapshot, or None for a new/expired
         session (the caller starts fresh — never reconstructs from elsewhere)."""
@@ -76,7 +95,7 @@ class RedisSessionStore:
         """Forget a session (idle eviction). Missing id is a no-op."""
         owner = self._get(self._owner(session_id))
         pipe = self._r.pipeline()
-        pipe.delete(self._snap(session_id), self._owner(session_id))
+        pipe.delete(self._snap(session_id), self._owner(session_id), self._turnmeta(session_id))
         if owner is not None:
             pipe.srem(self._owned(owner), session_id)
         pipe.execute()

@@ -189,7 +189,17 @@ async def test_unjudged_turn_streams_live_and_closes_with_the_envelope():
     assert envelope["answer"] == "the answer [1]\n\n### References\n- [1] Handbook.pdf"
     assert envelope["signal"] == "unjudged" and envelope["score"] is None
     assert envelope["references"] == [
-        {"n": 1, "title": "Handbook.pdf", "url": None, "cited": True}
+        {
+            "n": 1,
+            "title": "Handbook.pdf",
+            "url": None,
+            "cited": True,
+            # the raw source rides along so history can re-mint links later
+            "tool": "kb_search",
+            "region": None,
+            "path": "Handbook.pdf",
+            "fragment": "L755",
+        }
     ]
     await app.state.registry.shutdown_all()
 
@@ -273,4 +283,40 @@ async def test_references_are_per_turn_not_cumulative():
     second = await _post_stream(app, "c1", "q2")
     assert len(first[-1][1]["references"]) == 1
     assert second[-1][1]["references"] == []  # turn 1's refs were drained
+    await app.state.registry.shutdown_all()
+
+
+async def test_reloaded_conversation_carries_verdict_and_relinked_references(tmp_path):
+    # the sidecar makes the badge + References survive a reload; kb links are
+    # re-minted for the reader (stored tokens would expire before the chat)
+    (tmp_path / "hrus" / "Policies").mkdir(parents=True)
+    (tmp_path / "hrus" / "Policies" / "Handbook.pdf").write_bytes(b"%PDF handbook")
+    kb = "[1] hrus::Policies/Handbook.pdf#L755 (score 0.033)\nVacation policy text."
+    app = _app(
+        lambda: ScriptedProvider(
+            rounds=[
+                [ToolCallEvent(ToolCall("t1", "kb_search", "{}")), Done()],
+                [TextDelta("Vacation is covered [1]."), Done()],
+            ]
+        ),
+        judge_factory=lambda: QualityJudgeHook(ScriptedProvider(rounds=[_grade(0.8)])),
+        kb_content=kb,
+        file_root=str(tmp_path),
+    )
+    events = await _post_stream(app, "c1", "q")
+    live = events[-1][1]
+    assert live["signal"] == "ok"
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        view = (await c.get("/v1/conversations/c1")).json()
+        answer = [m for m in view["messages"] if m["role"] == "assistant"][-1]
+        assert (answer["signal"], answer["score"]) == ("ok", 0.8)
+        (ref,) = answer["references"]
+        assert ref["title"] == "Handbook.pdf" and ref["cited"] is True
+        assert ref["url"].startswith("/v1/files/") and ref["url"].endswith("#L755")
+        assert ref["url"] != live["references"][0]["url"]  # minted fresh, not the stored one
+        served = await c.get(ref["url"].split("#", 1)[0])
+        assert served.status_code == 200  # and it opens
+        # user rows carry no sidecar
+        assert "signal" not in next(m for m in view["messages"] if m["role"] == "user")
     await app.state.registry.shutdown_all()

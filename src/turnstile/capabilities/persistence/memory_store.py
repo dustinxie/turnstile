@@ -32,8 +32,21 @@ class MemorySessionStore:
         # with the session. M7's Redis store carries it the same way.
         self._owners: dict[str, str] = {}
 
+        # Per-turn sidecar written by the DRIVER (signal, score, references):
+        # L2 collector output that must not enter the kernel snapshot (design
+        # doc: never smuggle product data through contract DTOs), yet must
+        # outlive the turn so a reloaded conversation shows it again.
+        self._turn_meta: dict[str, dict[int, dict]] = {}
+
     def save(self, session_id: str, snapshot: SessionSnapshot) -> None:
         self._latest[session_id] = snapshot
+
+    def save_turn_meta(self, session_id: str, turn: int, meta: dict) -> None:
+        self._turn_meta.setdefault(session_id, {})[turn] = meta
+
+    def load_turn_meta(self, session_id: str) -> dict[int, dict]:
+        """turn number -> sidecar, for every recorded turn of the session."""
+        return dict(self._turn_meta.get(session_id, {}))
 
     def claim(self, session_id: str, owner: str) -> str:
         """First claimant wins; returns the session's owner AFTER the call —
@@ -57,6 +70,7 @@ class MemorySessionStore:
         """Forget a session (idle eviction). Missing id is a no-op."""
         self._latest.pop(session_id, None)
         self._owners.pop(session_id, None)
+        self._turn_meta.pop(session_id, None)
 
     def checkpoint(self, session_id: str) -> CompactionCheckpoint:
         """A session-bound CompactionCheckpoint to pass as Agent.checkpoint."""

@@ -44,9 +44,18 @@ export interface ConversationSummary {
   in_flight: boolean
 }
 
+export interface ViewMessage {
+  role: 'user' | 'assistant' | 'system' | 'tool'
+  text: string
+  // present on a turn's final assistant message: the persisted sidecar
+  signal?: Signal
+  score?: number | null
+  references?: Reference[]
+}
+
 export interface ConversationView {
   conversation_id: string
   turn_counter: number
   in_flight: boolean
-  messages: { role: 'user' | 'assistant' | 'system' | 'tool'; text: string }[]
+  messages: ViewMessage[]
 }

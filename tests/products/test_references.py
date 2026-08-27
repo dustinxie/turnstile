@@ -195,17 +195,27 @@ async def test_finish_appends_a_references_section_for_cited_numbers_only():
         "- [1] [FTNT 2026 OE Webinar FAQ Final v2.pdf](/v1/files/tok-1#L521)\n"
         "- [3] [2026 Holiday Calendar.pdf](/v1/files/tok-3#L3)"
     )
+
     # the structured list carries EVERY numbered doc; the uncited handbook
     # is ground truth of retrieval, flagged rather than dropped
+    def entry(n, title, path, fragment, cited):
+        # the raw source (tool/region/path/fragment) rides along so a later
+        # reader can re-mint a link instead of trusting a stored, expiring one
+        return {
+            "n": n,
+            "title": title,
+            "url": f"/v1/files/tok-{n}#{fragment}",
+            "cited": cited,
+            "tool": "kb_search",
+            "region": "hrus",
+            "path": path,
+            "fragment": fragment,
+        }
+
     assert structured == [
-        {
-            "n": 1,
-            "title": "FTNT 2026 OE Webinar FAQ Final v2.pdf",
-            "url": "/v1/files/tok-1#L521",
-            "cited": True,
-        },
-        {"n": 2, "title": "2024 Handbook.pdf", "url": "/v1/files/tok-2#L613", "cited": False},
-        {"n": 3, "title": "2026 Holiday Calendar.pdf", "url": "/v1/files/tok-3#L3", "cited": True},
+        entry(1, "FTNT 2026 OE Webinar FAQ Final v2.pdf", FAQ, "L521", True),
+        entry(2, "2024 Handbook.pdf", HANDBOOK, "L613", False),
+        entry(3, "2026 Holiday Calendar.pdf", CALENDAR, "L3", True),
     ]
     assert collector.take() == []  # finish drains like take
 

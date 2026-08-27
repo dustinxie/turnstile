@@ -207,3 +207,18 @@ def test_root_wires_retention_from_the_redis_section_not_eviction(redis_url):
     store = build_store(cfg.redis)  # the store needs only its own section
     assert isinstance(store, RedisSessionStore)
     assert store._ttl == 86400 * 30  # retention, not the 60s eviction knob
+
+
+def test_turn_meta_sidecar_persists_with_the_session(redis_url):
+    store = RedisSessionStore(redis_url, prefix="t5")
+    meta = {
+        "signal": "ok",
+        "score": 0.9,
+        "references": [{"n": 1, "title": "a.pdf", "cited": True}],
+    }
+    store.save_turn_meta("s", 1, meta)
+    store.save_turn_meta("s", 2, {"signal": "no_answer", "score": None, "references": []})
+    loaded = store.load_turn_meta("s")
+    assert loaded[1] == meta and loaded[2]["score"] is None  # int keys, JSON round-trip
+    store.drop("s")
+    assert store.load_turn_meta("s") == {}

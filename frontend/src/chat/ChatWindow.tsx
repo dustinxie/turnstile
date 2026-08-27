@@ -4,7 +4,7 @@
  * newline, Stop cancels).
  */
 import { useEffect, useRef, useState, type KeyboardEvent } from 'react'
-import type { Signal } from '../api/types'
+import type { Reference, Signal } from '../api/types'
 import { Markdown } from './Markdown'
 import type { ConversationState, Message } from './useConversation'
 
@@ -34,6 +34,17 @@ export function SignalBadge({ signal, score }: { signal: Signal; score: number |
   )
 }
 
+/** The References section for a RELOADED turn: the persisted answer text has
+ * no section (the service appends it only to the live envelope), so it is
+ * rendered from the structured list — cited documents only, same shape. */
+function ReferencesList({ references }: { references: Reference[] }) {
+  const cited = references.filter((r) => r.cited)
+  if (cited.length === 0) return null
+  const line = (r: Reference) => (r.url ? `- [${r.n}] [${r.title}](${r.url})` : `- [${r.n}] ${r.title}`)
+  const text = '### References\n' + cited.map(line).join('\n')
+  return <Markdown text={text} references={references} />
+}
+
 function Bubble({ message }: { message: Message }) {
   const mine = message.role === 'user'
   return (
@@ -50,6 +61,9 @@ function Bubble({ message }: { message: Message }) {
           message.text
         ) : (
           <Markdown text={message.text} references={message.envelope?.references} />
+        )}
+        {!mine && message.envelope && !/^### References/m.test(message.text) && (
+          <ReferencesList references={message.envelope.references} />
         )}
         {message.envelope && (
           <div className="mt-2">

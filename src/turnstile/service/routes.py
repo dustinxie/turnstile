@@ -17,6 +17,7 @@ import json
 import re
 from dataclasses import asdict, is_dataclass
 from enum import Enum
+from types import SimpleNamespace
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -113,6 +114,7 @@ async def post_message(
                         link=_file_link(request, principal),
                     )
                     yield {"event": "envelope", "data": json.dumps(envelope)}
+                    _record_turn_meta(entry, conversation_id, envelope)
                     entry.in_flight = False  # clean end: the slot frees here
                     return
         except (asyncio.CancelledError, GeneratorExit):
@@ -121,10 +123,30 @@ async def post_message(
             # user's message on every flaky network. A drainer adopts the event
             # stream so the queue never carries stale events into the next
             # pump, and in_flight stays True (a POST meanwhile still steers).
-            _adopt_detached(entry)
+            _adopt_detached(entry, conversation_id)
             raise
 
     return EventSourceResponse(stream())
+
+
+def _record_turn_meta(entry, conversation_id: str, envelope: dict) -> None:
+    """Persist the turn's L2 verdict + references beside the snapshot (never
+    inside it — design doc: collector data stays out of kernel DTOs) so a
+    reloaded conversation shows the badge and the References again. Keyed by
+    the turn the snapshot just recorded. Link URLs are NOT stored: a file
+    token expires long before the conversation does; GET re-mints them."""
+    snapshot = entry.bundle.store.load(conversation_id)
+    if snapshot is None or envelope["stop_reason"] != "stopped":
+        return
+    references = [
+        {**r, "url": r["url"] if r.get("tool") != "kb_search" else None}
+        for r in envelope["references"]
+    ]
+    entry.bundle.store.save_turn_meta(
+        conversation_id,
+        snapshot.turn_counter,
+        {"signal": envelope["signal"], "score": envelope["score"], "references": references},
+    )
 
 
 def _file_link(request: Request, principal: str):
@@ -152,13 +174,13 @@ def _file_link(request: Request, principal: str):
 _DETACHED: set[asyncio.Task] = set()
 
 
-def _adopt_detached(entry) -> None:
-    task = asyncio.create_task(_drain_detached(entry))
+def _adopt_detached(entry, conversation_id: str) -> None:
+    task = asyncio.create_task(_drain_detached(entry, conversation_id))
     _DETACHED.add(task)
     task.add_done_callback(_DETACHED.discard)
 
 
-async def _drain_detached(entry) -> None:
+async def _drain_detached(entry, conversation_id: str) -> None:
     """Consume the abandoned turn's events until it completes (they are not
     lost — the snapshot hook persists the turn; a reconnecting client
     refetches via GET). Also exits if the session task dies (eviction), so a
@@ -170,7 +192,17 @@ async def _drain_detached(entry) -> None:
         )
         if getter in done:
             if isinstance(getter.result(), ev.TurnComplete):
-                entry.bundle.references.take()  # discard: refs are per-turn
+                # nobody is watching, but the turn still happened: record its
+                # verdict + references for the reconnecting client's refetch
+                # (links re-minted on read, so no principal is needed here)
+                envelope = build_envelope(
+                    conversation_id,
+                    entry.bundle.store.load(conversation_id),
+                    stop_reason=getter.result().reason.value,
+                    judge=entry.bundle.judge,
+                    references=entry.bundle.references,
+                )
+                _record_turn_meta(entry, conversation_id, envelope)
                 entry.in_flight = False
                 return
         else:
@@ -238,13 +270,46 @@ async def get_conversation(
     if snapshot is None:
         return JSONResponse({"detail": "unknown conversation"}, status_code=404)
     entry = request.app.state.registry.get(conversation_id)
+    turn_meta = request.app.state.store.load_turn_meta(conversation_id)
+    link = _file_link(request, principal)
+    messages = []
+    for i, m in enumerate(snapshot.messages):
+        if not m.text or m.synthetic:
+            continue
+        row: dict = {"role": m.role.value, "text": m.text}
+        turn = m.meta.turn_id if m.meta is not None else 0
+        # the turn's FINAL assistant message carries the turn's verdict +
+        # references (a judge-retried turn has earlier drafts; those get none)
+        if m.role is Role.ASSISTANT and turn in turn_meta and _is_last_of_turn(snapshot, i, turn):
+            meta = turn_meta[turn]
+            row["signal"], row["score"] = meta["signal"], meta["score"]
+            row["references"] = [_relink(r, link) for r in meta["references"]]
+        messages.append(row)
     return {
         "conversation_id": conversation_id,
         "turn_counter": snapshot.turn_counter,
         "in_flight": bool(entry and entry.in_flight),
-        "messages": [
-            {"role": m.role.value, "text": m.text}
-            for m in snapshot.messages
-            if m.text and not m.synthetic
-        ],
+        "messages": messages,
     }
+
+
+def _is_last_of_turn(snapshot, index: int, turn: int) -> bool:
+    for later in snapshot.messages[index + 1 :]:
+        if later.role is Role.ASSISTANT and later.meta is not None and later.meta.turn_id == turn:
+            return False
+    return True
+
+
+def _relink(reference: dict, link) -> dict:
+    """A stored reference with a fresh link for THIS reader: kb documents get a
+    file token minted now (bound to the requesting principal); web sources
+    keep their URL."""
+    if reference.get("tool") == "kb_search" and reference.get("region") and reference.get("path"):
+        source = SimpleNamespace(
+            url=None,
+            region=reference["region"],
+            ref=reference["path"],
+            fragment=reference.get("fragment"),
+        )
+        return {**reference, "url": link(source)}
+    return reference

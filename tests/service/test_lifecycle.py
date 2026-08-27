@@ -162,7 +162,11 @@ async def test_disconnect_lets_the_turn_finish_detached():
         assert refetch.status_code == 200
         body = refetch.json()
         assert body["in_flight"] is False and body["turn_counter"] == 1
-        assert {"role": "assistant", "text": "the detached answer"} in body["messages"]
+        # the detached turn's answer is there, WITH its sidecar: the drainer
+        # recorded verdict + references even though no client was watching
+        answer = next(m for m in body["messages"] if m["role"] == "assistant")
+        assert answer["text"] == "the detached answer"
+        assert answer["signal"] == "unjudged" and answer["references"] == []
 
         # and the next turn streams clean — no stale events from turn 1
         events = await _post_stream(client, "c1", "q2")
@@ -192,8 +196,8 @@ async def test_get_returns_the_persisted_conversation():
         body = (await client.get("/v1/conversations/c1")).json()
     assert body["conversation_id"] == "c1"
     assert body["turn_counter"] == 1 and body["in_flight"] is False
-    assert body["messages"] == [
-        {"role": "user", "text": "q1"},
-        {"role": "assistant", "text": "a1"},
+    assert [(m["role"], m["text"]) for m in body["messages"]] == [
+        ("user", "q1"),
+        ("assistant", "a1"),
     ]
     await app.state.registry.shutdown_all()

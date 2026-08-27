@@ -88,3 +88,14 @@ async def test_hook_saves_a_snapshot_per_turn_and_resume_is_monotonic():
     assert [m.text for m in second.messages] == ["q1", "a1", "q2", "a2"]
     assert second.turn_counter == 2  # monotonic across the resume boundary
     assert second.request_counter > first.request_counter
+
+
+def test_turn_meta_sidecar_rides_the_session():
+    store = MemorySessionStore()
+    assert store.load_turn_meta("s") == {}
+    store.save_turn_meta("s", 1, {"signal": "ok", "score": 0.9, "references": []})
+    store.save_turn_meta("s", 2, {"signal": "low_quality", "score": 0.1, "references": []})
+    assert sorted(store.load_turn_meta("s")) == [1, 2]
+    assert store.load_turn_meta("s")[2]["signal"] == "low_quality"
+    store.drop("s")
+    assert store.load_turn_meta("s") == {}  # dies with the session

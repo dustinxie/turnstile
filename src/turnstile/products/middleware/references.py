@@ -150,7 +150,18 @@ class ReferenceCollector(ToolMiddleware):
         cited = {int(n) for n in _INLINE_CITE_RE.findall(body)}
 
         structured = [
-            {"n": r.n, "title": _title(r), "url": link(r), "cited": r.n in cited}
+            {
+                "n": r.n,
+                "title": _title(r),
+                "url": link(r),
+                "cited": r.n in cited,
+                # the raw source, so a later reader (history) can re-mint a link
+                # for its own principal instead of trusting a stored, expiring one
+                "tool": r.tool,
+                "region": r.region,
+                "path": r.ref,
+                "fragment": r.fragment,
+            }
             for r in references
         ]
         # One list item per document: consecutive bare lines would be ONE

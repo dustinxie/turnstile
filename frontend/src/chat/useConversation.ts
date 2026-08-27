@@ -169,7 +169,24 @@ export function useConversation(conversationId: string) {
     const view = await getConversation(id)
     const messages: Message[] = (view?.messages ?? [])
       .filter((m) => m.role === 'user' || m.role === 'assistant')
-      .map((m) => ({ id: nextId(), role: m.role as 'user' | 'assistant', text: m.text }))
+      .map((m) => ({
+        id: nextId(),
+        role: m.role as 'user' | 'assistant',
+        text: m.text,
+        // a reloaded turn: the persisted verdict + references render like a
+        // live envelope (badge + References list)
+        envelope:
+          m.signal !== undefined
+            ? {
+                conversation_id: id,
+                answer: m.text,
+                signal: m.signal,
+                score: m.score ?? null,
+                references: m.references ?? [],
+                stop_reason: 'stopped',
+              }
+            : undefined,
+      }))
     dispatch({ type: 'reset', conversationId: id, messages })
   }, [])
 

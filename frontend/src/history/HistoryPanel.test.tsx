@@ -17,7 +17,17 @@ const VIEWS: Record<string, unknown> = {
       { role: 'system', text: 'persona' },
       { role: 'user', text: 'how many sick hours?' },
       { role: 'tool', text: '[1] hrus::x.pdf#L1\nchunk' },
-      { role: 'assistant', text: '80 hours [1].' },
+      {
+        role: 'assistant',
+        text: '80 hours [1].',
+        // the persisted sidecar: verdict + references come back with history
+        signal: 'ok',
+        score: 0.85,
+        references: [
+          { n: 1, title: 'x.pdf', url: '/v1/files/tok-fresh#L1', cited: true },
+          { n: 2, title: 'unused.pdf', url: null, cited: false },
+        ],
+      },
     ],
   },
 }
@@ -48,9 +58,14 @@ test('selecting a conversation loads its history (user + assistant only)', async
   render(<App />)
   const user = userEvent.setup()
   await user.click(await screen.findByRole('button', { name: 'how many sick hours?' }))
-  expect(await screen.findByText('80 hours [1].')).toBeInTheDocument()
+  expect(await screen.findByText(/80 hours/)).toBeInTheDocument()
   expect(screen.getByText('how many sick hours?', { selector: '[data-role="user"]' })).toBeInTheDocument()
   expect(screen.queryByText('persona')).toBeNull() // system/tool rows are not transcript
+  // reloaded turn renders like a live one: badge + References (cited only)
+  expect(screen.getByTestId('signal')).toHaveTextContent('confidence: 0.85')
+  expect(screen.getByRole('heading', { name: 'References' })).toBeInTheDocument()
+  expect(screen.getByRole('link', { name: 'x.pdf' })).toHaveAttribute('href', '/v1/files/tok-fresh#L1')
+  expect(screen.queryByText(/unused\.pdf/)).toBeNull()
   expect(screen.getByRole('button', { name: 'how many sick hours?' })).toHaveAttribute(
     'aria-current',
     'true',
@@ -79,10 +94,10 @@ test('New chat clears the window; the list refreshes after the first turn settle
   render(<App />)
   const user = userEvent.setup()
   await user.click(await screen.findByRole('button', { name: 'how many sick hours?' }))
-  await screen.findByText('80 hours [1].')
+  await screen.findByText(/80 hours/)
 
   await user.click(screen.getByRole('button', { name: 'New chat' }))
-  expect(screen.queryByText('80 hours [1].')).toBeNull()
+  expect(screen.queryByText(/80 hours/)).toBeNull()
   expect(screen.getByText('Ask a question to start a conversation.')).toBeInTheDocument()
 
   await user.type(screen.getByLabelText('message'), 'fresh q')
