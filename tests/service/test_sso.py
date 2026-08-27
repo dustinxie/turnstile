@@ -110,6 +110,10 @@ async def test_initiate_redirects_to_the_idp(monkeypatch):
         response = await client.get("/sso", follow_redirects=False)
     assert response.status_code == 302
     assert response.headers["location"].startswith("https://fac.example/idp/sso")
+    # the login-in-progress marker a shared proxy can route the ACS POST by
+    cookie = response.headers["set-cookie"]
+    assert cookie.startswith("turnstile_login=1") and "Path=/sso" in cookie
+    assert "SameSite=none" in cookie and "Secure" in cookie  # survives the cross-site POST
 
 
 # ── the ACS: SAML in, our JWT out ──────────────────────────────────────
@@ -125,6 +129,7 @@ async def test_acs_mints_a_working_user_token(monkeypatch):
         response = await _acs(client)
         token = _token_from(response)
         assert response.headers["location"].startswith("/#token=")  # default return_url
+        assert 'turnstile_login=""' in response.headers["set-cookie"]  # marker cleared
 
         claims = pyjwt.decode(token, SECRET, algorithms=["HS256"])
         assert claims["sub"] == "alice"  # lowercased

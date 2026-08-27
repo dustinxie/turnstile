@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+_LOGIN_COOKIE = "turnstile_login"
 _BINDING_POST = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST"
 _BINDING_REDIRECT = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect"
 
@@ -115,7 +116,17 @@ async def initiate_sso(request: Request, next: str | None = None) -> RedirectRes
     """Kick off login: 302 to the IdP with a signed AuthnRequest. `next` (a
     same-origin path) rides RelayState and comes back on the ACS."""
     auth = init_saml_auth(_prepare_request(request), request.app.state.cfg.saml)
-    return RedirectResponse(url=auth.login(return_to=_safe_next(next)), status_code=302)
+    response = RedirectResponse(url=auth.login(return_to=_safe_next(next)), status_code=302)
+    # COMPROMISE while we share the host with the previous assistant: a
+    # "login in progress" marker the reverse proxy uses to route the IdP's
+    # ACS POST (/sso/acs, registered once at FAC) to THIS service instead of
+    # the other app. The browser carries it back from the IdP; SameSite=None
+    # because that POST is cross-site; short-lived; cleared by the ACS.
+    # Remove with the proxy map when the previous assistant is retired.
+    response.set_cookie(
+        _LOGIN_COOKIE, "1", max_age=300, path="/sso", secure=True, httponly=True, samesite="none"
+    )
+    return response
 
 
 @router.post("/sso/acs")
@@ -139,7 +150,7 @@ async def sso_acs(request: Request) -> RedirectResponse:
         )
         raise HTTPException(status_code=401, detail="sso failed")
 
-    attributes = auth.get_attributes()  # may carry PII — never log above DEBUG
+    attributes = auth.get_attributes()  # may carry PII — never log values above DEBUG
     username = _first(attributes, "username", "Username").lower()
     if not username:
         logger.warning("SAML assertion carried no username (attributes=%s)", sorted(attributes))
@@ -150,7 +161,9 @@ async def sso_acs(request: Request) -> RedirectResponse:
     token = mint_token(cfg.jwt_secret, username, role=role)
     relay = form.get("RelayState")
     target = _safe_next(relay if isinstance(relay, str) else None) or cfg.saml.return_url
-    return RedirectResponse(url=f"{target}#token={token}", status_code=302)
+    response = RedirectResponse(url=f"{target}#token={token}", status_code=302)
+    response.delete_cookie(_LOGIN_COOKIE, path="/sso")
+    return response
 
 
 @router.get("/sso/metadata")

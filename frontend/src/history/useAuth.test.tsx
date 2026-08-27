@@ -32,7 +32,7 @@ test('dev mode: no login UI, just "anonymous"', async () => {
   expect(screen.queryByRole('button', { name: 'Log in' })).toBeNull()
 })
 
-test('auth required, nobody signed in: the login screen, one action -> /sso', async () => {
+test('auth required, nobody signed in: the login screen, one action -> /v1/sso', async () => {
   server.use(health(true, true))
   const go = vi.spyOn(navigation, 'go').mockImplementation(() => {})
   render(<App />)
@@ -40,7 +40,7 @@ test('auth required, nobody signed in: the login screen, one action -> /sso', as
   const button = await screen.findByRole('button', { name: 'Log in as Employee' })
   expect(screen.queryByLabelText('message')).toBeNull() // no chat UI behind it
   await user.click(button)
-  expect(go).toHaveBeenCalledWith('/sso?next=%2F')
+  expect(go).toHaveBeenCalledWith('/v1/sso?next=%2F')
 })
 
 test('SSO available but auth off (dev with saml): chat renders, "Log in" offered in the panel', async () => {

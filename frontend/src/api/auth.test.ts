@@ -43,8 +43,8 @@ test('a 401 drops the token and sends the browser to login with the return path'
   ssoAvailable.value = true
   onUnauthorized()
   expect(localStorage.getItem(TOKEN_KEY)).toBeNull()
-  expect(go).toHaveBeenCalledWith('/sso?next=%2Fchat%2Fc1')
-  expect(loginUrl('/x')).toBe('/sso?next=%2Fx')
+  expect(go).toHaveBeenCalledWith('/v1/sso?next=%2Fchat%2Fc1')
+  expect(loginUrl('/x')).toBe('/v1/sso?next=%2Fx')
   // no SSO route on this deployment: back to the root, the login screen takes over
   ssoAvailable.value = false
   onUnauthorized()

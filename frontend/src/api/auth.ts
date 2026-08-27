@@ -50,9 +50,13 @@ export function logout(): void {
 }
 
 /** Where to send the browser to log in; `next` = the path to come back to
- * (rides SAML RelayState; the service accepts same-origin paths only). */
+ * (rides SAML RelayState; the service accepts same-origin paths only).
+ * COMPROMISE while we share the host with the previous assistant: login
+ * starts at /v1/sso (nginx rewrites it to the app's /sso) because the bare
+ * /sso path is routed by a proxy rule between the two apps. Revert to /sso
+ * when the previous assistant is retired. */
 export function loginUrl(next: string = window.location.pathname): string {
-  return `/sso?next=${encodeURIComponent(next)}`
+  return `/v1/sso?next=${encodeURIComponent(next)}`
 }
 
 /** Indirection so tests can observe navigation (jsdom cannot navigate). */

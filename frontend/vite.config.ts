@@ -13,7 +13,14 @@ const target = process.env.VITE_API_TARGET ?? 'http://127.0.0.1:8000'
 export default defineConfig({
   plugins: [react(), tailwindcss()],
   server: {
-    proxy: { '/v1': target, '/health': target, '/sso': target },
+    proxy: {
+      // COMPROMISE (shared host): login starts at /v1/sso; nginx rewrites it
+      // to the app's /sso in prod, this does the same in dev
+      '/v1/sso': { target, rewrite: (path: string) => path.replace(/^\/v1/, '') },
+      '/v1': target,
+      '/health': target,
+      '/sso': target,
+    },
   },
   test: {
     environment: 'jsdom',
